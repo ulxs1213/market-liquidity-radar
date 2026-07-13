@@ -15,6 +15,7 @@ from quant_dashboard.market_heatmap_history import MarketHeatmapHistoryStore
 class FixtureProvider:
     def __init__(self) -> None:
         self.round = 0
+        self.last_stock_sort_field = None
 
     def sectors(self, board_type: str):
         self.round += 1
@@ -25,11 +26,12 @@ class FixtureProvider:
         ]
         return rows, {"provider": "fixture", "possibly_delayed": False, "elapsed_ms": 1}
 
-    def stocks(self, fs: str, limit: int = 120):
+    def stocks(self, fs: str, limit: int = 120, sort_field: str = "f6"):
+        self.last_stock_sort_field = sort_field
         rows = [
-            {"f12": "600001", "f13": 1, "f14": "放量上涨", "f2": 10, "f3": 8, "f6": 200_000_000, "f8": 4, "f10": 3, "f62": 30_000_000, "f100": "半导体", "f103": "芯片,算力", "f124": 1_700_011_860},
-            {"f12": "000002", "f13": 0, "f14": "放量下跌", "f2": 8, "f3": -7, "f6": 180_000_000, "f8": 5, "f10": 2.5, "f62": -25_000_000, "f100": "房地产", "f103": "深圳板块", "f124": 1_700_011_860},
-            {"f12": "600003", "f13": 1, "f14": "平稳活跃", "f2": 12, "f3": 0.2, "f6": 300_000_000, "f8": 2, "f10": 1.2, "f62": 5_000_000, "f100": "半导体", "f103": "芯片", "f124": 1_700_011_860},
+            {"f12": "600001", "f13": 1, "f14": "放量上涨", "f2": 10, "f3": 8, "f5": 9_000, "f6": 200_000_000, "f8": 4, "f10": 3, "f62": 30_000_000, "f100": "半导体", "f102": "上海板块", "f103": "芯片,算力", "f124": 1_700_011_860},
+            {"f12": "000002", "f13": 0, "f14": "放量下跌", "f2": 8, "f3": -7, "f5": 3_000, "f6": 180_000_000, "f8": 5, "f10": 2.5, "f62": -25_000_000, "f100": "房地产", "f102": "深圳板块", "f103": "深圳板块", "f124": 1_700_011_860},
+            {"f12": "600003", "f13": 1, "f14": "平稳活跃", "f2": 12, "f3": 0.2, "f5": 6_000, "f6": 300_000_000, "f8": 2, "f10": 1.2, "f62": 5_000_000, "f100": "半导体", "f102": "北京板块", "f103": "芯片", "f124": 1_700_011_860},
         ]
         return rows, {"provider": "fixture", "possibly_delayed": False, "elapsed_ms": 1}
 
@@ -90,8 +92,8 @@ class MarketHeatmapServiceTest(unittest.TestCase):
     def test_new_listing_and_extreme_gain_are_excluded_from_liquidity_surfaces(self) -> None:
         original = self.provider.stocks
 
-        def stocks(fs: str, limit: int = 120):
-            rows, source = original(fs, limit)
+        def stocks(fs: str, limit: int = 120, sort_field: str = "f6"):
+            rows, source = original(fs, limit, sort_field)
             rows.extend([
                 {"f12": "001399", "f13": 0, "f14": "N新样本", "f2": 80, "f3": 800, "f6": 9_000_000_000, "f8": 70, "f10": 20, "f62": 600_000_000, "f124": 1_700_000_000},
                 {"f12": "001398", "f13": 0, "f14": "极端样本", "f2": 50, "f3": 45, "f6": 8_000_000_000, "f8": 60, "f10": 18, "f62": 500_000_000, "f124": 1_700_000_000},
@@ -106,6 +108,23 @@ class MarketHeatmapServiceTest(unittest.TestCase):
         self.assertNotIn("001398", visible_codes | queue_codes)
         self.assertEqual(payload["exclusion_policy"]["excluded_count"], 2)
         self.assertIn("40%", payload["exclusion_policy"]["rule"])
+
+    def test_liquidity_watch_uses_real_f5_and_returns_volume_desc(self) -> None:
+        payload = self.service.liquidity_watch(limit=180, force=True)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(self.provider.last_stock_sort_field, "f5")
+        self.assertEqual([row["code"] for row in payload["stocks"]], ["600001", "600003", "000002"])
+        self.assertEqual([row["volume"] for row in payload["stocks"]], [9_000, 6_000, 3_000])
+        self.assertEqual(payload["field_units"]["volume"], "手")
+        self.assertEqual(payload["display_sort"]["upstream_field"], "f5")
+        self.assertEqual(payload["stocks"][0]["region_board"], "上海板块")
+
+    def test_missing_region_sentinel_is_not_exposed_as_a_board_name(self) -> None:
+        for sentinel in (None, "", "-", "--"):
+            with self.subTest(sentinel=sentinel):
+                row = self.service._stock_rows([{"f12": "600099", "f13": 1, "f14": "样本", "f5": 100, "f102": sentinel}])[0]
+                self.assertEqual(row["region_board"], "未分类")
+                self.assertEqual(row["industry_code"], "未分类")
 
     def test_sqlite_history_and_minute_flow_are_merged_for_full_day_views(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -298,10 +317,10 @@ class MarketHeatmapServiceTest(unittest.TestCase):
                     "source": {"host": "fixture"},
                     "stocks": [
                         {"code": "600001", "market": "SH", "name": "芯片股", "data_time": stamp, "price": 10 + factor,
-                         "amount": 100_000 * factor, "change_pct": 2 * factor, "volume_ratio": 2, "activity_score": 5,
+                         "amount": 100_000 * factor, "volume": 1_000 * factor, "change_pct": 2 * factor, "volume_ratio": 2, "activity_score": 5,
                          "industry": "半导体", "concepts": "芯片,算力", "primary_concept": "芯片", "rank": 1},
                         {"code": "000002", "market": "SZ", "name": "地产股", "data_time": stamp, "price": 8,
-                         "amount": 80_000 * factor, "change_pct": -2, "volume_ratio": 1.5, "activity_score": 4,
+                         "amount": 80_000 * factor, "volume": 2_000 * factor, "change_pct": -2, "volume_ratio": 1.5, "activity_score": 4,
                          "industry": "房地产", "concepts": "地产", "primary_concept": "地产", "rank": 2},
                     ],
                 })
@@ -312,6 +331,8 @@ class MarketHeatmapServiceTest(unittest.TestCase):
             self.assertEqual(frame["snapshot"]["mode"], "historical_replay")
             self.assertEqual({row["code"] for row in frame["snapshot"]["sectors"]}, {"BK0001", "BK0002"})
             self.assertEqual({row["code"] for row in frame["liquidity"]["stocks"]}, {"600001", "000002"})
+            self.assertEqual([row["code"] for row in frame["liquidity"]["stocks"]], ["000002", "600001"])
+            self.assertEqual(frame["liquidity"]["field_units"]["volume"], "手")
             self.assertEqual([row["code"] for row in frame["core_stocks"]["stocks"]], ["600001"])
             self.assertEqual(frame["race"]["data_mode"], "local_observed_replay")
             self.assertTrue(all(len(row["points"]) == 1 for row in frame["race"]["series"]))
@@ -560,17 +581,20 @@ class EastmoneyProviderPaginationTest(unittest.TestCase):
 
         def fake_get(_path, params):
             page = int(params["pn"])
-            calls.append((page, params["pz"]))
+            calls.append((page, params["pz"], params["fid"]))
             start = (page - 1) * 100
             rows = [{"f12": f"{index:06d}"} for index in range(start, start + 100)]
             return {"rc": 0, "data": {"total": 5000, "diff": rows}}, {"elapsed_ms": 1}
 
         provider._get = fake_get
-        rows, source = provider.stocks("all", limit=180)
-        self.assertEqual(calls, [(1, 100), (2, 100)])
+        rows, source = provider.stocks("all", limit=180, sort_field="f5")
+        self.assertEqual(calls, [(1, 100, "f5"), (2, 100, "f5")])
         self.assertEqual(len(rows), 180)
         self.assertEqual(source["requested_limit"], 180)
         self.assertTrue(source["complete"])
+        self.assertEqual(source["sort_field"], "f5")
+        self.assertTrue(source["requested_limit_complete"])
+        self.assertFalse(source["full_universe_returned"])
 
 
 if __name__ == "__main__":

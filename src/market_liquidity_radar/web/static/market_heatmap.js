@@ -98,6 +98,27 @@
     const rounded = Math.round(Number(value || 0) / 1e8);
     return `${Object.is(rounded, -0) ? 0 : rounded}亿`;
   };
+  const fmtVolumeLots = value => {
+    const lots = Number(value);
+    if (!Number.isFinite(lots) || lots <= 0) return "--";
+    if (lots >= 1e8) return `${(lots / 1e8).toFixed(2)}亿手`;
+    if (lots >= 1e4) return `${(lots / 1e4).toFixed(2)}万手`;
+    return `${Math.round(lots).toLocaleString("zh-CN")}手`;
+  };
+  const fmtVolumeAxis = value => {
+    const lots = Number(value);
+    if (!Number.isFinite(lots) || lots <= 0) return "0";
+    if (lots >= 1e8) return `${Number((lots / 1e8).toPrecision(2))}亿`;
+    if (lots >= 1e4) return `${Number((lots / 1e4).toPrecision(2))}万`;
+    return String(Math.round(lots));
+  };
+  const fmtSharesFromLots = value => {
+    const shares = Number(value) * 100;
+    if (!Number.isFinite(shares) || shares <= 0) return "--";
+    if (shares >= 1e8) return `${(shares / 1e8).toFixed(2)}亿股`;
+    if (shares >= 1e4) return `${(shares / 1e4).toFixed(2)}万股`;
+    return `${Math.round(shares).toLocaleString("zh-CN")}股`;
+  };
   const fmtPct = (value) => `${Number(value || 0) >= 0 ? "+" : ""}${Number(value || 0).toFixed(2)}%`;
   const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, Number(value)));
   const normalizeHex = value => {
@@ -290,10 +311,27 @@
     const raw = Number(payload?.session_progress?.blank_from_index);
     return Number.isFinite(raw) ? Math.max(0, Math.min(categories.length, raw)) : categories.length;
   };
+  // Classification colors deliberately avoid the A-share semantic red/green
+  // lanes, which remain reserved for gain/inflow and loss/outflow.
+  const CLASSIFICATION_COLORS = [
+    "#2563eb", "#4f46e5", "#7c3aed", "#9333ea", "#c026d3", "#db2777",
+    "#d97706", "#b7791f", "#0891b2", "#0e7490", "#475569", "#6d5dfc",
+  ];
   const stableColor = value => {
     let hash = 0;
     for (const char of String(value || "未分类")) hash = ((hash << 5) - hash + char.charCodeAt(0)) | 0;
-    return `hsl(${Math.abs(hash) % 360} 58% 56% / .78)`;
+    return CLASSIFICATION_COLORS[Math.abs(hash) % CLASSIFICATION_COLORS.length];
+  };
+  const semanticTextColor = (value, palette) => Number(value) > 0 ? palette.up : Number(value) < 0 ? palette.down : palette.muted;
+  const classificationTextColor = (value, palette) => {
+    const toward = relativeLuminance(palette.panel) > .5 ? "#000000" : "#ffffff";
+    return contrastSafeColor(stableColor(value), [palette.panel, palette.surface], toward);
+  };
+  const classificationTag = (label, title, palette) => {
+    const name = String(label || "未分类");
+    const base = stableColor(name);
+    const textColor = classificationTextColor(name, palette);
+    return `<span style="display:inline-flex;align-items:center;gap:5px;padding:2px 7px;border:1px solid ${base};border-radius:999px;background:${palette.surface};color:${textColor};white-space:nowrap"><i style="width:7px;height:7px;border-radius:50%;background:${base};display:inline-block"></i>${esc(title)} ${esc(name)}</span>`;
   };
   function sparkSvg(points, direction) {
     const rows = tradingPoints(points);
@@ -774,10 +812,12 @@
   }
   function renderLiquidity(payload) {
     const palette = chartTheme();
-    const allStocks = payload.stocks || [];
+    const allStocks = [...(payload.stocks || [])].sort((a, b) => Number(b.volume || 0) - Number(a.volume || 0) || Number(b.amount || 0) - Number(a.amount || 0) || String(a.code || "").localeCompare(String(b.code || "")));
     const stocks = allStocks.slice(0, STATE.liquidityLimit);
     const liquidityTime = stocks.map(row => row.data_time || "").sort().at(-1) || "--";
-    $("liquiditySource").textContent = `前${stocks.length}/${allStocks.length}只 · ${payload.source?.provider || "来源未知"}${payload.source?.possibly_delayed ? "·可能延迟" : ""} · ${liquidityTime.replace("T", " ")}`;
+    const universeTotal = Number(payload.source?.reported_total || allStocks.length);
+    const candidateCount = Number(payload.source?.row_count || allStocks.length);
+    $("liquiditySource").textContent = `成交量TOP${stocks.length} · 候选池${candidateCount}/${universeTotal}只 · 横轴=涨跌幅 · 纵轴=成交量（手，对数轴） · 气泡=成交额 · ${payload.source?.provider || "来源未知"}${payload.source?.possibly_delayed ? "·可能延迟" : ""} · ${liquidityTime.replace("T", " ")}`;
     const policy = payload.exclusion_policy || {};
     const excluded = (policy.excluded || []).slice(0, 6).map(row => `${row.name} ${fmtPct(row.change_pct)}`).join("、");
     $("liquidityExclusion").textContent = `${policy.rule || "新股与上市初期极端涨幅样本不进入核心流动性面板"}；本帧已剔除 ${Number(policy.excluded_count || 0)} 只${excluded ? `（${excluded}）` : ""}。`;
@@ -786,15 +826,57 @@
     const groupField = STATE.liquidityColorMode === "industry" ? "industry" : "primary_concept";
     const groupCounts = new Map();
     if (STATE.liquidityColorMode !== "performance") stocks.forEach(row => groupCounts.set(row[groupField] || "未分类", (groupCounts.get(row[groupField] || "未分类") || 0) + 1));
-    $("liquidityLegend").innerHTML = STATE.liquidityColorMode === "performance" ? "" : [...groupCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 18).map(([name, count]) => `<span class="legend-chip"><i style="background:${stableColor(name)}"></i>${esc(name)} ${count}</span>`).join("");
-    const pointColor = row => STATE.liquidityColorMode === "performance" ? (row.change_pct >= 0 ? palette.up : palette.down) : stableColor(row[groupField] || "未分类");
+    $("liquidityLegend").innerHTML = STATE.liquidityColorMode === "performance"
+      ? `<span class="legend-chip" style="--legend-color:${palette.up};--legend-text:${palette.up}"><i style="background:${palette.up}"></i>↑ 上涨</span><span class="legend-chip" style="--legend-color:${palette.down};--legend-text:${palette.down}"><i style="background:${palette.down}"></i>↓ 下跌</span><span class="legend-chip" style="--legend-color:${palette.muted};--legend-text:${palette.muted}"><i style="background:${palette.muted}"></i>— 平盘</span>`
+      : [...groupCounts.entries()].sort((a, b) => b[1] - a[1]).map(([name, count]) => {
+      const base = stableColor(name);
+      const textColor = classificationTextColor(name, palette);
+      return `<span class="legend-chip" style="--legend-color:${base};--legend-text:${textColor}"><i style="background:${base}"></i>${esc(name)} ${count}</span>`;
+    }).join("");
+    const pointColor = row => STATE.liquidityColorMode === "performance" ? semanticTextColor(row.change_pct, palette) : stableColor(row[groupField] || "未分类");
     scatterChart.setOption({
       animation: false,
-      tooltip: { formatter: p => { const r = p?.data?.raw; if (!r) return esc(p?.name || ""); return `<b>${r.name}</b> ${r.code}.${r.market}<br>行业 ${esc(r.industry || "未分类")} · 主概念 ${esc(r.primary_concept || "未分类")}<br>涨跌 ${fmtPct(r.change_pct)} · 量比 ${r.volume_ratio.toFixed(2)}<br>成交额 ${fmtMoney(r.amount)} · 主力净流 ${fmtMoney(r.main_net_inflow)}<br>概念 ${esc(r.concepts || "--")}`; }, backgroundColor: palette.panel, borderColor: palette.line, textStyle: { color: palette.text } },
-      grid: { left: 55, right: 24, top: 24, bottom: 44 },
+      tooltip: {
+        confine: true,
+        backgroundColor: palette.panel,
+        borderColor: palette.line,
+        borderWidth: 1,
+        padding: [10, 12],
+        textStyle: { color: palette.text, fontSize: 11, lineHeight: 18 },
+        extraCssText: "border-radius:10px;box-shadow:0 8px 26px rgba(0,0,0,.18);max-width:440px;",
+        formatter: p => {
+          const r = p?.data?.raw;
+          if (!r) return esc(p?.name || "");
+          const industry = r.industry || "未分类";
+          const primaryConcept = r.primary_concept || "未分类";
+          const regionBoard = r.region_board || r.industry_code || "未分类";
+          const conceptItems = String(r.concepts || "").split(/[,;，；]/).map(item => item.trim()).filter(Boolean);
+          const otherConcepts = conceptItems.filter(item => item !== primaryConcept).slice(0, 6);
+          const remainingConcepts = Math.max(0, conceptItems.length - otherConcepts.length - (conceptItems.includes(primaryConcept) ? 1 : 0));
+          const changeColor = semanticTextColor(r.change_pct, palette);
+          const flowColor = semanticTextColor(r.main_net_inflow, palette);
+          const groupColor = STATE.liquidityColorMode === "performance" ? changeColor : stableColor(r[groupField] || "未分类");
+          const changeDirection = Number(r.change_pct || 0) > 0 ? "↑ 上涨" : Number(r.change_pct || 0) < 0 ? "↓ 下跌" : "— 平盘";
+          const flowDirection = Number(r.main_net_inflow || 0) > 0 ? "↑ 净流入" : Number(r.main_net_inflow || 0) < 0 ? "↓ 净流出" : "— 净额为零";
+          const volumeText = fmtVolumeLots(r.volume);
+          return `<div style="min-width:300px;color:${palette.text}">
+            <div style="display:flex;justify-content:space-between;gap:12px;align-items:baseline;margin-bottom:7px"><b style="font-size:14px;color:${palette.text};display:inline-flex;align-items:center;gap:6px"><i style="width:9px;height:9px;border-radius:50%;background:${groupColor};display:inline-block"></i>${esc(r.name)}</b><span style="color:${palette.muted};font-variant-numeric:tabular-nums">${esc(r.code)}.${esc(r.market)}</span></div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">${classificationTag(industry, "行业", palette)}${classificationTag(primaryConcept, "概念板块", palette)}${classificationTag(regionBoard, "地域板块", palette)}</div>
+            <div style="display:grid;grid-template-columns:auto 1fr;column-gap:12px;row-gap:3px;color:${palette.muted}">
+              <span>涨跌幅</span><b style="color:${changeColor};font-variant-numeric:tabular-nums">${changeDirection} ${fmtPct(r.change_pct)}</b>
+              <span>成交量</span><b style="color:${palette.text};font-variant-numeric:tabular-nums">${volumeText}${volumeText === "--" ? "（暂无有效 f5）" : `（约${fmtSharesFromLots(r.volume)}）`}</b>
+              <span>成交额</span><b style="color:${palette.text};font-variant-numeric:tabular-nums">${fmtMoney(r.amount)}</b>
+              <span>量比 / 换手</span><b style="color:${palette.text};font-variant-numeric:tabular-nums">${Number(r.volume_ratio || 0).toFixed(2)} / ${fmtPct(r.turnover_pct)}</b>
+              <span>主力资金</span><b style="color:${flowColor};font-variant-numeric:tabular-nums">${flowDirection} ${fmtMoney(r.main_net_inflow)}</b>
+            </div>
+            <div style="margin-top:8px;color:${palette.muted};white-space:normal;max-width:410px">其他概念：${otherConcepts.length ? esc(otherConcepts.join("、")) : "--"}${remainingConcepts ? ` 等${conceptItems.length}项` : ""}</div>
+          </div>`;
+        },
+      },
+      grid: { left: 78, right: 24, top: 28, bottom: 48 },
       xAxis: { type: "value", name: "涨跌幅 %", nameTextStyle: { color: palette.muted }, axisLabel: { color: palette.muted, formatter: "{value}%" }, splitLine: { lineStyle: { color: palette.line } } },
-      yAxis: { type: "value", name: "量比", nameTextStyle: { color: palette.muted }, axisLabel: { color: palette.muted }, splitLine: { lineStyle: { color: palette.line } } },
-      series: [{ type: "scatter", data: stocks.map(row => ({ value: [row.change_pct, Math.min(12, row.volume_ratio), row.amount], raw: row, symbolSize: Math.max(7, Math.min(34, 7 + 27 * Math.sqrt(row.amount / p90))), itemStyle: { color: pointColor(row), borderColor: pointColor(row), opacity: .78, borderWidth: 0 } })), markLine: { silent: true, lineStyle: { color: palette.line, type: "dashed" }, data: [{ xAxis: 0 }, { yAxis: 1 }] } }],
+      yAxis: { type: "log", logBase: 10, min: 1, name: "成交量（手，对数轴）", nameTextStyle: { color: palette.muted }, axisLabel: { color: palette.muted, formatter: fmtVolumeAxis }, splitLine: { lineStyle: { color: palette.line } } },
+      series: [{ type: "scatter", data: stocks.map(row => ({ value: [Number(row.change_pct || 0), Math.max(1, Number(row.volume || 0)), Number(row.amount || 0)], raw: row, symbolSize: Math.max(7, Math.min(34, 7 + 27 * Math.sqrt(Math.max(0, Number(row.amount || 0)) / p90))), itemStyle: { color: pointColor(row), borderColor: pointColor(row), opacity: .82, borderWidth: 0 } })), markLine: { silent: true, lineStyle: { color: palette.line, type: "dashed" }, data: [{ xAxis: 0 }] } }],
     }, { notMerge: true, lazyUpdate: true, silent: true });
     renderQueue("surgingQueue", payload.queues?.surging);
     renderQueue("activeQueue", payload.queues?.active);

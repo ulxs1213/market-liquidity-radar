@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <link rel="icon" href="data:,">
   <title>市场流动性雷达</title>
-  <link rel="stylesheet" href="/static/market_heatmap.css?v=20260714.30">
+  <link rel="stylesheet" href="/static/market_heatmap.css?v=20260714.31">
   <script src="/static/echarts.min.js"></script>
 </head>
 <body>
@@ -202,11 +202,11 @@
         <div class="density-controls liquidity-count-control">
           <label>标的 <input id="liquidityCount" type="range" min="0" max="4" step="1" value="1"><b id="liquidityCountLabel">TOP50</b></label>
         </div>
-        <small id="liquiditySource">横轴=涨跌幅 · 纵轴=量比 · 气泡=成交额</small>
+        <small id="liquiditySource">横轴=涨跌幅 · 纵轴=成交量（手，对数轴） · 气泡=成交额</small>
       </div>
       <div class="exclusion-note" id="liquidityExclusion">新股与上市初期极端涨幅样本将从核心流动性面板剔除。</div>
       <div id="liquidityLegend" class="classification-legend" aria-label="行业或概念着色图例"></div>
-      <div id="liquidityScatter" class="chart chart-wide" role="img" tabindex="0" aria-label="全市场流动性散点图；双击标的打开05B终端"></div>
+      <div id="liquidityScatter" class="chart chart-wide" role="img" tabindex="0" aria-label="全市场流动性散点图；横轴涨跌幅，纵轴成交量，气泡面积成交额；双击标的打开05B终端"></div>
       <div id="stockTerminalHome" class="stock-terminal-home">
         <div id="stockTerminalWorkspace" class="stock-terminal-workspace">
           <div class="intraday-title">
@@ -291,6 +291,6 @@
       </div>
     </div>
   </dialog>
-  <script src="/static/market_heatmap.js?v=20260714.30"></script>
+  <script src="/static/market_heatmap.js?v=20260714.31"></script>
 </body>
 </html>

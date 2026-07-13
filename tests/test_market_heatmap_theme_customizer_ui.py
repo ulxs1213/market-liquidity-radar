@@ -284,10 +284,10 @@ class MarketHeatmapThemeCustomizerUiContractTest(unittest.TestCase):
         for target in expected_targets:
             self.assertEqual(JS.count(f'echarts.init($("{target}"))'), 1, target)
 
-    def test_theme_assets_use_the_20260714_30_cache_version(self) -> None:
-        self.assertEqual(HTML.count("20260714.30"), 2)
-        self.assertIn('href="/static/market_heatmap.css?v=20260714.30"', HTML)
-        self.assertIn('src="/static/market_heatmap.js?v=20260714.30"', HTML)
+    def test_theme_assets_use_the_20260714_31_cache_version(self) -> None:
+        self.assertEqual(HTML.count("20260714.31"), 2)
+        self.assertIn('href="/static/market_heatmap.css?v=20260714.31"', HTML)
+        self.assertIn('src="/static/market_heatmap.js?v=20260714.31"', HTML)
 
 
 if __name__ == "__main__":

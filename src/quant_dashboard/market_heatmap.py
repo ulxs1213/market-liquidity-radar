@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
 import threading
 import time
@@ -23,9 +22,8 @@ from quant_dashboard.trading_calendar import (
 )
 
 
-ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = Path(os.getenv("MLR_DATA_DIR", str(ROOT / "data"))).expanduser().resolve()
-CACHE_DIR = DATA_DIR / "market_heatmap"
+ROOT = Path(__file__).resolve().parents[1]
+CACHE_DIR = ROOT / "data" / "market_heatmap"
 EM_HOSTS = (
     ("https://push2.eastmoney.com", False),
     ("https://push2delay.eastmoney.com", True),
@@ -216,8 +214,14 @@ class EastmoneyHeatmapProvider:
         source["complete"] = reported_total == 0 or len(unique_rows) >= reported_total
         return unique_rows, source
 
-    def stocks(self, fs: str, limit: int = 120) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    def stocks(
+        self,
+        fs: str,
+        limit: int = 120,
+        sort_field: str = "f6",
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         requested = max(10, min(500, limit))
+        sort_field = sort_field if sort_field in {"f5", "f6"} else "f6"
         rows: list[dict[str, Any]] = []
         seen_codes: set[str] = set()
         source: dict[str, Any] = {}
@@ -238,7 +242,7 @@ class EastmoneyHeatmapProvider:
                     "ut": EM_UT,
                     "fltt": 2,
                     "invt": 2,
-                    "fid": "f6",
+                    "fid": sort_field,
                     "fs": fs,
                     "fields": STOCK_FIELDS,
                 },
@@ -268,7 +272,12 @@ class EastmoneyHeatmapProvider:
         source["reported_total"] = reported_total
         source["requested_limit"] = requested
         source["row_count"] = len(rows)
-        source["complete"] = len(rows) >= target_count
+        source["complete"] = len(rows) >= target_count  # legacy: requested candidate count only
+        source["requested_limit_complete"] = len(rows) >= target_count
+        source["sort_field"] = sort_field
+        source["sort_direction"] = "desc"
+        source["candidate_complete"] = len(rows) >= target_count
+        source["full_universe_returned"] = reported_total > 0 and len(rows) >= reported_total
         return rows, source
 
     def fund_flow_timeline(self, secid: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -385,13 +394,11 @@ class MarketHeatmapService:
         provider: EastmoneyHeatmapProvider | None = None,
         history_store: MarketHeatmapHistoryStore | None = None,
         historical_bar_fetcher: Callable[[str, date], list[dict[str, Any]]] | None = None,
-        cache_dir: Path | str | None = None,
     ) -> None:
         self.ttl_seconds = max(1.0, ttl_seconds)
         self.provider = provider or EastmoneyHeatmapProvider()
         self.history_store = history_store
         self.historical_bar_fetcher = historical_bar_fetcher
-        self.cache_dir = Path(cache_dir or CACHE_DIR).expanduser().resolve()
         self._lock = threading.Lock()
         self._flow_locks: defaultdict[str, threading.Lock] = defaultdict(threading.Lock)
         self._history_lock = threading.Lock()
@@ -540,8 +547,9 @@ class MarketHeatmapService:
             return "afternoon"
         return "closed"
 
-    def _cache_path(self, board_type: str) -> Path:
-        return self.cache_dir / f"latest_{board_type}.json"
+    @staticmethod
+    def _cache_path(board_type: str) -> Path:
+        return CACHE_DIR / f"latest_{board_type}.json"
 
     def _load_disk_cache(self, board_type: str) -> dict[str, Any] | None:
         try:
@@ -782,6 +790,8 @@ class MarketHeatmapService:
             change = _number(raw.get("f3"))
             volume_ratio = _number(raw.get("f10"))
             turnover = _number(raw.get("f8"))
+            raw_region_board = str(raw.get("f102") or "").strip()
+            region_board = "未分类" if raw_region_board in {"", "-", "--"} else raw_region_board
             activity_score = (
                 math.log10(max(1.0, amount)) * 0.35
                 + min(20.0, abs(change)) * 0.25
@@ -809,7 +819,10 @@ class MarketHeatmapService:
                     "main_net_inflow": flow,
                     "main_net_ratio": flow / amount * 100 if amount else 0.0,
                     "industry": str(raw.get("f100") or "未分类"),
-                    "industry_code": str(raw.get("f102") or ""),
+                    # f102 is a region/area board label in the current Eastmoney
+                    # payload (for example “广东板块”), not an industry code.
+                    "region_board": region_board,
+                    "industry_code": region_board,  # backward-compatible alias
                     "concepts": str(raw.get("f103") or ""),
                     "primary_concept": next(
                         (item.strip() for item in re.split(r"[,;，；]", str(raw.get("f103") or "")) if item.strip()),
@@ -887,7 +900,7 @@ class MarketHeatmapService:
         return {"active": active, "surging": up, "falling": down}
 
     def liquidity_watch(self, limit: int = 120, force: bool = False) -> dict[str, Any]:
-        cache_key = f"liquidity:{limit}"
+        cache_key = f"liquidity:volume:{limit}"
         now = time.monotonic()
         cached = self._cache.get(cache_key)
         session_status = a_share_session_status(datetime.now())
@@ -900,15 +913,20 @@ class MarketHeatmapService:
             if not force and cached and time.monotonic() < cached[0]:
                 return dict(cached[1], response_cached=True)
             try:
-                raw_rows, source = self.provider.stocks("m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23", limit=limit)
+                raw_rows, source = self.provider.stocks(
+                    "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+                    limit=limit,
+                    sort_field="f5",
+                )
                 parsed_stocks = self._stock_rows(raw_rows)
                 excluded = [row for row in parsed_stocks if row.get("is_new_listing")]
-                stocks = sorted(
-                    [row for row in parsed_stocks if not row.get("is_new_listing")],
+                eligible_stocks = [row for row in parsed_stocks if not row.get("is_new_listing")]
+                activity_ranked = sorted(
+                    eligible_stocks,
                     key=lambda row: row["activity_score"], reverse=True,
                 )
                 next_ranks: dict[str, int] = {}
-                for rank, row in enumerate(stocks, start=1):
+                for rank, row in enumerate(activity_ranked, start=1):
                     previous_rank = self._liquidity_ranks.get(row["code"])
                     row["rank"] = rank
                     row["previous_rank"] = previous_rank
@@ -916,10 +934,21 @@ class MarketHeatmapService:
                     row["entered_watch"] = previous_rank is None
                     next_ranks[row["code"]] = rank
                 self._liquidity_ranks = next_ranks
+                stocks = sorted(
+                    eligible_stocks,
+                    key=lambda row: (-_number(row.get("volume")), -_number(row.get("amount")), row["code"]),
+                )
                 payload = {
                     "ok": True,
                     "generated_at": _iso_now(),
                     "source": source,
+                    "display_sort": {
+                        "metric": "volume",
+                        "upstream_field": "f5",
+                        "direction": "desc",
+                        "tie_breakers": ["amount desc", "code asc"],
+                        "queue_rank_basis": "activity_score desc",
+                    },
                     "field_units": {
                         "price": "人民币元/股",
                         "change_pct": "百分比",
@@ -1250,17 +1279,23 @@ class MarketHeatmapService:
             }
             return chosen_name in concepts or str(row.get("primary_concept") or "").strip() == chosen_name
 
+        for row in stocks:
+            row["region_board"] = str(row.get("region_board") or row.get("industry_code") or "未分类")
         core_stocks = sorted(
             [row for row in stocks if belongs_to_selected(row)],
             key=lambda row: _number(row.get("amount")),
             reverse=True,
         )
-        stocks = sorted(stocks, key=lambda row: _number(row.get("activity_score")), reverse=True)
-        for rank, row in enumerate(stocks, start=1):
+        activity_ranked = sorted(stocks, key=lambda row: _number(row.get("activity_score")), reverse=True)
+        for rank, row in enumerate(activity_ranked, start=1):
             row["rank"] = rank
             row["previous_rank"] = None
             row["rank_change"] = None
             row["entered_watch"] = False
+        stocks = sorted(
+            stocks,
+            key=lambda row: (-_number(row.get("volume")), -_number(row.get("amount")), str(row.get("code") or "")),
+        )
 
         axis_payload = self.session_axis(selected_date)
         labels = (axis_payload.get("session_axis") or {}).get("labels") or []
@@ -1338,6 +1373,23 @@ class MarketHeatmapService:
             "ok": bool(stocks),
             "generated_at": _iso_now(),
             "source": local_source,
+            "display_sort": {
+                "metric": "volume",
+                "upstream_field": "stored f5",
+                "direction": "desc",
+                "tie_breakers": ["amount desc", "code asc"],
+                "queue_rank_basis": "stored activity_score desc",
+            },
+            "field_units": {
+                "price": "人民币元/股",
+                "change_pct": "百分比",
+                "amount": "人民币元",
+                "volume": "手",
+                "volume_ratio": "倍",
+                "turnover_pct": "百分比",
+                "main_net_inflow": "人民币元",
+                "main_net_ratio": "百分比",
+            },
             "stocks": stocks,
             "queues": self._queues(stocks, limit=20),
             "exclusion_policy": {
@@ -2097,9 +2149,19 @@ class MarketHeatmapService:
                     "endpoint": "/api/qt/clist/get",
                     "host_policy": "同上",
                     "query": "fs=b:BKxxxx，按成交额获取板块成分",
-                    "fields": "f2价格、f3涨跌幅、f6成交额、f8换手、f10量比、f62估算主力净流入、f100行业、f103概念列表、f124数据时间",
+                    "fields": "f2价格、f3涨跌幅、f5成交量（手）、f6成交额、f8换手、f10量比、f62估算主力净流入、f100行业、f102地域板块、f103概念列表、f124数据时间",
                     "cadence": "当前选中板块目标3秒",
                     "contract": "非官方稳定契约",
+                },
+                {
+                    "surface": "全市场流动性核心标的",
+                    "provider": "东方财富公开行情页接口",
+                    "endpoint": "/api/qt/clist/get",
+                    "host_policy": "同上",
+                    "query": "沪深A股集合；fid=f5、po=1，先取全市场成交量降序候选，再按 volume desc、amount desc、code asc 稳定排序",
+                    "fields": "f2价格、f3涨跌幅、f5成交量（手）、f6成交额、f8换手、f10量比、f62估算主力净流入、f100行业、f102地域板块、f103概念列表、f124数据时间",
+                    "cadence": "页面目标3秒；重图遵守交互延后策略",
+                    "contract": "候选池最多500只，不等于全市场全量返回；成交量来自f5且单位为手；f102是地域板块而非行业代码；非官方稳定契约",
                 },
                 {
                     "surface": "全天分钟资金流",
@@ -2194,10 +2256,4 @@ class MarketHeatmapService:
         }
 
 
-def create_service(data_dir: Path | str | None = None) -> MarketHeatmapService:
-    """Build one isolated service instance for the selected local data directory."""
-    root = Path(data_dir or DATA_DIR).expanduser().resolve()
-    return MarketHeatmapService(
-        history_store=MarketHeatmapHistoryStore(root / "market_heatmap" / "market_heatmap_intraday.sqlite3"),
-        cache_dir=root / "market_heatmap",
-    )
+SERVICE = MarketHeatmapService(history_store=MarketHeatmapHistoryStore())
