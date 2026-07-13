@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "market-liquidity-radar"
-version = "1.0.0"
+version = "1.1.0"
 description = "Local-first A-share market liquidity visualization dashboard"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
 authors = [{ name = "Market Liquidity Radar contributors" }]
 dependencies = [
-  "requests==2.32.5",
-  "urllib3==2.6.3",
+  "requests==2.34.2",
+  "urllib3==2.7.0",
 ]
 classifiers = [
   "Development Status :: 4 - Beta",

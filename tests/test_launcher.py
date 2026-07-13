@@ -50,6 +50,16 @@ class LauncherTests(unittest.TestCase):
     def test_health_endpoint_and_full_dashboard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             server = create_server("127.0.0.1", 0, Path(temporary))
+            stamp = "2026-07-13T09:31:00"
+            server.service.history_store.record_sectors({
+                "board_type": "industry",
+                "generated_at": stamp,
+                "source": {"host": "fixture"},
+                "sectors": [
+                    {"code": "BK0001", "name": "半导体", "data_time": stamp, "main_net_inflow": 100},
+                    {"code": "BK0002", "name": "房地产", "data_time": stamp, "main_net_inflow": -80},
+                ],
+            })
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
@@ -67,6 +77,13 @@ class LauncherTests(unittest.TestCase):
                     axis = json.loads(response.read().decode("utf-8"))
                 self.assertEqual(242, len(axis["session_axis"]["labels"]))
                 self.assertEqual("15:00", axis["session_axis"]["display_end"])
+                with urlopen(f"http://127.0.0.1:{port}/api/market_heatmap/replay_manifest?board_type=industry&trade_date=2026-07-13", timeout=2) as response:
+                    manifest = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(["09:31"], [row["label"] for row in manifest["frames"]])
+                with urlopen(f"http://127.0.0.1:{port}/api/market_heatmap/replay_frame?board_type=industry&trade_date=2026-07-13&frame_time=09%3A31", timeout=2) as response:
+                    frame = json.loads(response.read().decode("utf-8"))
+                self.assertTrue(frame["ok"])
+                self.assertEqual("09:31", frame["frame_time"])
             finally:
                 server.shutdown()
                 server.server_close()

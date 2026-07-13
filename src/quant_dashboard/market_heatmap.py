@@ -365,7 +365,7 @@ class EastmoneyHeatmapProvider:
                     "f53": "分钟开盘价",
                     "f54": "分钟最高价",
                     "f55": "分钟最低价",
-                    "f56": "分钟成交量",
+                    "f56": "分钟成交量（手；普通A股通常1手=100股）",
                     "f57": "分钟成交额",
                     "f58": "当日均价",
                 },
@@ -1108,6 +1108,283 @@ class MarketHeatmapService:
             current = previous_trading_day(current)
         return result
 
+    def replay_manifest(self, board_type: str = "industry", trade_date: str = "") -> dict[str, Any]:
+        """Expose locally archived replay frames and their factual gaps."""
+        if self.history_store is None:
+            return {
+                "ok": False,
+                "board_type": board_type,
+                "trade_date": str(trade_date or "")[:10],
+                "frames": [],
+                "available_dates": [],
+                "error": "8772本地连续历史库未启用，无法回放",
+            }
+        payload = self.history_store.replay_manifest(board_type, trade_date)
+        payload["generated_at"] = _iso_now()
+        payload["playback"] = {
+            "speeds": [1, 2, 5],
+            "unit": "每步推进一个本地已观察分钟帧",
+            "default_speed": 1,
+            "live_refresh_paused_during_replay": True,
+        }
+        return payload
+
+    def replay_frame(
+        self,
+        board_type: str = "industry",
+        trade_date: str = "",
+        frame_time: str = "",
+        selected_code: str = "",
+        top_each: int = 5,
+    ) -> dict[str, Any]:
+        """Build all replay surfaces from one exact locally observed minute.
+
+        Cross-sections are never carried forward.  The race trajectories are
+        clipped at the frame time, and core-stock membership is returned only
+        when it was actually retained in the historical stock row.
+        """
+        board_type = str(board_type or "industry").lower()
+        manifest = self.replay_manifest(board_type, trade_date)
+        if not manifest.get("ok"):
+            return manifest
+        selected_date = str(manifest.get("trade_date") or "")[:10]
+        requested_label = str(frame_time or "")[-5:]
+        frame_index = next(
+            (
+                index for index, item in enumerate(manifest.get("frames") or [])
+                if str(item.get("label") or "") == requested_label
+            ),
+            -1,
+        )
+        if frame_index < 0:
+            return {
+                "ok": False,
+                "board_type": board_type,
+                "trade_date": selected_date,
+                "frame_time": requested_label,
+                "error": "所选分钟不是本地已保存回放帧；缺口不会插值",
+            }
+        frame_meta = manifest["frames"][frame_index]
+        sectors, stocks = self.history_store.replay_frame_rows(
+            board_type, selected_date, requested_label
+        ) if self.history_store is not None else ([], [])
+        if not sectors:
+            return {
+                "ok": False,
+                "board_type": board_type,
+                "trade_date": selected_date,
+                "frame_time": requested_label,
+                "frame": frame_meta,
+                "coverage": manifest.get("coverage") or {},
+                "error": "该分钟只有个股留档，没有板块横截面；未沿用上一帧",
+            }
+
+        if board_type == "concept":
+            sectors = [
+                row for row in sectors
+                if str(row.get("name") or "").strip() not in CONCEPT_AGGREGATE_BOARD_NAMES
+            ]
+        inflow_all = sorted(
+            [row for row in sectors if _number(row.get("main_net_inflow")) > 0],
+            key=lambda row: _number(row.get("main_net_inflow")),
+            reverse=True,
+        )
+        outflow_all = sorted(
+            [row for row in sectors if _number(row.get("main_net_inflow")) < 0],
+            key=lambda row: _number(row.get("main_net_inflow")),
+        )
+        safe_top = max(1, min(500, int(top_each or 5)))
+        selected_race = [
+            *[dict(row, race_direction="inflow") for row in inflow_all[:safe_top]],
+            *[dict(row, race_direction="outflow") for row in outflow_all[:safe_top]],
+        ]
+        history_date, grouped = self.history_store.sector_points_bulk(
+            board_type,
+            [row["code"] for row in selected_race],
+            selected_date,
+            limit_per_code=360,
+        ) if self.history_store is not None else (selected_date, {})
+        race_series = []
+        for row in selected_race:
+            points = [
+                {
+                    "time": point.get("data_time"),
+                    "flow": _number(point.get("flow")),
+                    "change_pct": _number(point.get("change_pct")),
+                    "amount": _number(point.get("amount")),
+                    "resolution": "1m-local-observed-replay",
+                }
+                for point in (grouped.get(row["code"]) or [])
+                if str(point.get("data_time") or "")[11:16] <= requested_label
+            ]
+            race_series.append(
+                {
+                    "code": row["code"],
+                    "name": row["name"],
+                    "direction": row["race_direction"],
+                    "snapshot_flow": row["main_net_inflow"],
+                    "snapshot_change_pct": row["change_pct"],
+                    "points": points,
+                    "latest_flow": _number(points[-1].get("flow")) if points else 0.0,
+                    "component_count": 0,
+                    "components": [],
+                    "error": "" if points else "该板块在当前回放时间前没有本地分钟轨迹",
+                }
+            )
+
+        chosen_sector = next((row for row in sectors if row.get("code") == selected_code), None)
+        if chosen_sector is None:
+            chosen_sector = inflow_all[0] if inflow_all else (sectors[0] if sectors else None)
+        chosen_code = str((chosen_sector or {}).get("code") or "")
+        chosen_name = str((chosen_sector or {}).get("name") or "")
+
+        def belongs_to_selected(row: dict[str, Any]) -> bool:
+            if not chosen_name:
+                return False
+            if board_type == "industry":
+                return str(row.get("industry") or "").strip() == chosen_name
+            concepts = {
+                item.strip()
+                for item in re.split(r"[,;，；]", str(row.get("concepts") or ""))
+                if item.strip()
+            }
+            return chosen_name in concepts or str(row.get("primary_concept") or "").strip() == chosen_name
+
+        core_stocks = sorted(
+            [row for row in stocks if belongs_to_selected(row)],
+            key=lambda row: _number(row.get("amount")),
+            reverse=True,
+        )
+        stocks = sorted(stocks, key=lambda row: _number(row.get("activity_score")), reverse=True)
+        for rank, row in enumerate(stocks, start=1):
+            row["rank"] = rank
+            row["previous_rank"] = None
+            row["rank_change"] = None
+            row["entered_watch"] = False
+
+        axis_payload = self.session_axis(selected_date)
+        labels = (axis_payload.get("session_axis") or {}).get("labels") or []
+        elapsed_slots = labels.index(requested_label) + 1 if requested_label in labels else 0
+        replay_progress = {
+            "status": "historical_replay",
+            "as_of": f"{selected_date}T{requested_label}:00",
+            "elapsed_slots": elapsed_slots,
+            "remaining_slots": max(0, len(labels) - elapsed_slots),
+            "total_slots": len(labels),
+            "last_elapsed_index": elapsed_slots - 1,
+            "last_elapsed_label": requested_label,
+            "blank_from_index": elapsed_slots,
+            "completion_ratio": round(elapsed_slots / len(labels), 6) if labels else 0.0,
+            "is_complete": elapsed_slots == len(labels),
+        }
+        local_source = {
+            "provider": "8772本地SQLite真实分钟留档",
+            "host": str(self.history_store.path) if self.history_store is not None else "",
+            "possibly_delayed": False,
+            "contract": "精确读取所选分钟，不前向填充、不插值；缺口直接报告。",
+        }
+        coverage = dict(manifest.get("coverage") or {})
+        coverage.update(
+            {
+                "frame": frame_meta,
+                "core_stock_membership_available": bool(core_stocks),
+                "core_stock_limitation": (
+                    "按本分钟留档的行业/概念字段筛选全市场流动性样本；只覆盖当时进入本地TOP采集池的股票。"
+                    if core_stocks else
+                    "该帧没有可核验的板块成员分类留档，核心个股留空；不会用当前成分冒充历史成分。"
+                ),
+            }
+        )
+        snapshot = {
+            "ok": True,
+            "generated_at": _iso_now(),
+            "data_time": f"{selected_date}T{requested_label}:00",
+            "board_type": board_type,
+            "refresh_interval_ms": int(self.ttl_seconds * 1000),
+            "mode": "historical_replay",
+            "stale": False,
+            "source": local_source,
+            "status_message": f"历史回放 {selected_date} {requested_label}；仅展示本地真实留档帧。",
+            "sectors": sectors,
+            "response_cached": False,
+        }
+        race = {
+            "ok": bool(race_series),
+            "generated_at": _iso_now(),
+            "board_type": board_type,
+            "trade_date": selected_date,
+            "top_each": safe_top,
+            "data_mode": "local_observed_replay",
+            "series": race_series,
+            "populated_series": sum(bool(item["points"]) for item in race_series),
+            "available_dates": [str(row.get("trade_date") or "") for row in manifest.get("available_dates") or []],
+            "selection_basis": f"{selected_date} {requested_label} 本地精确横截面",
+            "source_disclosure": {
+                "title": "8772本地f62历史帧回放",
+                "provider": local_source["provider"],
+                "endpoint": "market_heatmap_intraday.sqlite3 / sector_intraday",
+                "fields": "data_time、f62主力净流入、涨跌幅、成交额",
+                "method": f"按{requested_label}精确横截面选择每侧TOP{safe_top}，曲线仅截取到当前回放帧",
+                "limitation": coverage.get("contract") or "本地未采集分钟不可恢复",
+            },
+            "selection": {
+                "inflow": [{"code": row["code"], "name": row["name"], "flow": row["main_net_inflow"]} for row in inflow_all[:safe_top]],
+                "outflow": [{"code": row["code"], "name": row["name"], "flow": row["main_net_inflow"]} for row in outflow_all[:safe_top]],
+            },
+            "session_axis": axis_payload.get("session_axis") or {},
+            "session_progress": replay_progress,
+        }
+        liquidity = {
+            "ok": bool(stocks),
+            "generated_at": _iso_now(),
+            "source": local_source,
+            "stocks": stocks,
+            "queues": self._queues(stocks, limit=20),
+            "exclusion_policy": {
+                "rule": "历史回放只使用当时已进入本地流动性采集池且已通过新股/极端涨幅过滤的样本",
+                "excluded_count": 0,
+                "excluded": [],
+            },
+        }
+        core_payload = {
+            "ok": bool(core_stocks),
+            "generated_at": _iso_now(),
+            "code": chosen_code,
+            "source": local_source,
+            "stocks": core_stocks,
+            "queues": self._queues(core_stocks),
+            "historical_membership": True,
+            "coverage_message": coverage["core_stock_limitation"],
+        }
+        sparklines = [
+            {
+                "code": item["code"],
+                "name": item["name"],
+                "points": item["points"],
+                "last": item["latest_flow"],
+            }
+            for item in race_series
+        ]
+        return {
+            "ok": True,
+            "generated_at": _iso_now(),
+            "board_type": board_type,
+            "trade_date": selected_date,
+            "frame_time": requested_label,
+            "frame_index": frame_index,
+            "frame_count": len(manifest.get("frames") or []),
+            "frame": frame_meta,
+            "coverage": coverage,
+            "snapshot": snapshot,
+            "race": race,
+            "liquidity": liquidity,
+            "core_stocks": core_payload,
+            "selected_code": chosen_code,
+            "sparklines": sparklines,
+            "session_axis": axis_payload.get("session_axis") or {},
+            "session_progress": replay_progress,
+        }
+
     def _history_bars(self, code: str, market: str, trade_date: str) -> dict[str, Any]:
         parsed_date = self._parse_trade_date(trade_date)
         if parsed_date is None:
@@ -1763,6 +2040,16 @@ class MarketHeatmapService:
             "data_mode": data_mode,
             "source_disclosure": source_disclosure,
             "price_source": price_source,
+            "price_volume_contract": {
+                "unit": "股" if requested_date else "手",
+                "share_multiplier": 1 if requested_date else 100,
+                "display": (
+                    "TDX历史分钟源的vol已在本地适配器中按100股/手换算为股"
+                    if requested_date else
+                    "东方财富trends2/get f56按手返回；页面同时按普通A股100股/手显示约合股数"
+                ),
+                "limitation": "约合股数是普通A股手数换算；特殊证券的每手规则应以交易所合约为准",
+            },
             "order_book": order_book,
             "session_contract": {
                 "call_auction": "09:15-09:29（可选，仅真实接口可得时显示）",
@@ -1833,6 +2120,16 @@ class MarketHeatmapService:
                     "fields": "原生f51/f52；本地f124/f62；历史代理分钟价格/成交量/带符号成交额累计",
                     "cadence": "横截面3秒；本地大范围曲线最多12秒重绘；历史日按日缓存",
                     "contract": "本地f62只代表本机实际观察分钟；历史成交方向代理不是原生主力净流",
+                },
+                {
+                    "surface": "全页面历史分钟回放",
+                    "provider": "8772本地SQLite真实分钟留档",
+                    "endpoint": "/api/market_heatmap/replay_manifest + /replay_frame",
+                    "host_policy": "只读 market_heatmap_intraday.sqlite3，不为缺失日或分钟访问外部接口补造截面",
+                    "query": "board_type、trade_date、frame_time、selected_code、top_each",
+                    "fields": "sector_intraday精确分钟横截面；stock_intraday精确分钟流动性样本与采集时分类；板块轨迹截断到当前帧",
+                    "cadence": "播放1×/2×/5×；每步推进一个本地已观察分钟，回放期间暂停3秒实时刷新",
+                    "contract": "缺口、旧库缺少分类、未进入当时采集池的股票均明确披露；不插值、不前向填充、不用当前成分冒充历史成分",
                 },
                 {
                     "surface": "个股仿真分时与五档盘口",

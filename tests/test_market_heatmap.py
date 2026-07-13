@@ -235,6 +235,93 @@ class MarketHeatmapServiceTest(unittest.TestCase):
             self.assertEqual(store.record_sectors(after_close), 0)
             self.assertEqual(store.record_sectors(user_mistaken_end), 0)
 
+    def test_replay_manifest_reports_observed_frames_and_minute_gaps_without_fill(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = MarketHeatmapHistoryStore(Path(temp) / "history.sqlite3")
+            for stamp in ("2026-07-13T09:31:00", "2026-07-13T09:33:00"):
+                store.record_sectors({
+                    "board_type": "industry",
+                    "generated_at": stamp,
+                    "source": {"host": "fixture"},
+                    "sectors": [
+                        {"code": "BK0001", "name": "半导体", "data_time": stamp, "main_net_inflow": 100},
+                        {"code": "BK0002", "name": "房地产", "data_time": stamp, "main_net_inflow": -80},
+                    ],
+                })
+            store.record_stocks({
+                "generated_at": "2026-07-13T09:31:00",
+                "source": {"host": "fixture"},
+                "stocks": [{
+                    "code": "600001", "market": "SH", "name": "芯片股", "data_time": "2026-07-13T09:31:00",
+                    "amount": 10_000, "change_pct": 2, "volume_ratio": 2, "activity_score": 5,
+                    "industry": "半导体", "concepts": "芯片,算力", "primary_concept": "芯片", "rank": 1,
+                }],
+            })
+            store.record_stocks({
+                "generated_at": "2026-07-13T09:34:00",
+                "source": {"host": "fixture"},
+                "stocks": [{
+                    "code": "600001", "market": "SH", "name": "芯片股", "data_time": "2026-07-13T09:34:00",
+                    "amount": 10_000, "change_pct": 2, "volume_ratio": 2, "activity_score": 5,
+                    "industry": "半导体", "concepts": "芯片,算力", "primary_concept": "芯片", "rank": 1,
+                }],
+            })
+
+            manifest = store.replay_manifest("industry", "2026-07-13")
+            self.assertTrue(manifest["ok"])
+            self.assertEqual([row["label"] for row in manifest["frames"]], ["09:31", "09:33"])
+            self.assertEqual(manifest["coverage"]["stock_only_frame_labels"], ["09:34"])
+            self.assertIn("09:32", manifest["coverage"]["sector_missing_minutes_within_coverage"])
+            self.assertIn("09:32", manifest["coverage"]["stock_missing_minutes_within_coverage"])
+            self.assertFalse(manifest["coverage"]["complete_day"])
+            self.assertTrue(manifest["coverage"]["classified_stock_rows_available"])
+            sectors, stocks = store.replay_frame_rows("industry", "2026-07-13", "09:32")
+            self.assertEqual(sectors, [])
+            self.assertEqual(stocks, [])
+
+    def test_replay_frame_links_exact_heatmap_race_liquidity_and_historical_core_stocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = MarketHeatmapHistoryStore(Path(temp) / "history.sqlite3")
+            for minute, factor in (("09:31", 1), ("09:33", 2)):
+                stamp = f"2026-07-13T{minute}:00"
+                store.record_sectors({
+                    "board_type": "industry",
+                    "generated_at": stamp,
+                    "source": {"host": "fixture"},
+                    "sectors": [
+                        {"code": "BK0001", "name": "半导体", "data_time": stamp, "main_net_inflow": 100 * factor, "change_pct": factor},
+                        {"code": "BK0002", "name": "房地产", "data_time": stamp, "main_net_inflow": -80 * factor, "change_pct": -factor},
+                    ],
+                })
+                store.record_stocks({
+                    "generated_at": stamp,
+                    "source": {"host": "fixture"},
+                    "stocks": [
+                        {"code": "600001", "market": "SH", "name": "芯片股", "data_time": stamp, "price": 10 + factor,
+                         "amount": 100_000 * factor, "change_pct": 2 * factor, "volume_ratio": 2, "activity_score": 5,
+                         "industry": "半导体", "concepts": "芯片,算力", "primary_concept": "芯片", "rank": 1},
+                        {"code": "000002", "market": "SZ", "name": "地产股", "data_time": stamp, "price": 8,
+                         "amount": 80_000 * factor, "change_pct": -2, "volume_ratio": 1.5, "activity_score": 4,
+                         "industry": "房地产", "concepts": "地产", "primary_concept": "地产", "rank": 2},
+                    ],
+                })
+            service = MarketHeatmapService(provider=self.provider, history_store=store)
+
+            frame = service.replay_frame("industry", "2026-07-13", "09:31", selected_code="BK0001", top_each=5)
+            self.assertTrue(frame["ok"])
+            self.assertEqual(frame["snapshot"]["mode"], "historical_replay")
+            self.assertEqual({row["code"] for row in frame["snapshot"]["sectors"]}, {"BK0001", "BK0002"})
+            self.assertEqual({row["code"] for row in frame["liquidity"]["stocks"]}, {"600001", "000002"})
+            self.assertEqual([row["code"] for row in frame["core_stocks"]["stocks"]], ["600001"])
+            self.assertEqual(frame["race"]["data_mode"], "local_observed_replay")
+            self.assertTrue(all(len(row["points"]) == 1 for row in frame["race"]["series"]))
+            self.assertEqual(frame["session_progress"]["last_elapsed_label"], "09:31")
+            self.assertEqual(frame["session_progress"]["blank_from_index"], 2)
+
+            missing = service.replay_frame("industry", "2026-07-13", "09:32")
+            self.assertFalse(missing["ok"])
+            self.assertIn("不会插值", missing["error"])
+
     def test_large_and_all_sector_race_use_one_local_f62_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             store = MarketHeatmapHistoryStore(Path(temp) / "history.sqlite3")
@@ -407,6 +494,30 @@ class MarketHeatmapServiceTest(unittest.TestCase):
         payload = self.service.snapshot("unexpected", force=True)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error_code"], "invalid_board_type")
+
+    def test_replay_frontend_controls_and_api_routes_are_wired(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        html = (root / "src/market_liquidity_radar/web/index.html").read_text(encoding="utf-8")
+        script = (root / "src/market_liquidity_radar/web/static/market_heatmap.js").read_text(encoding="utf-8")
+        server = (root / "src/market_liquidity_radar/server.py").read_text(encoding="utf-8")
+        for control in ("replayTradeDate", "replayPlay", "replaySpeed", "replayProgress", "replayCurrentTime", "replayLive"):
+            self.assertIn(f'id="{control}"', html)
+        for speed in ('value="1"', 'value="2"', 'value="5"'):
+            self.assertIn(speed, html)
+        for state_function in ("loadReplayCatalog", "loadReplayFrame", "setReplayPlaying", "returnToLive"):
+            self.assertIn(f"function {state_function}", script)
+        self.assertIn("stock_only_frame_labels", script)
+        self.assertIn('if (!STATE.paused && !STATE.replayMode)', script)
+        self.assertIn('/api/market_heatmap/replay_manifest', server)
+        self.assertIn('/api/market_heatmap/replay_frame', server)
+
+    def test_closed_live_snapshot_is_not_labeled_as_historical_replay(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "src/market_liquidity_radar/web/static/market_heatmap.js").read_text(encoding="utf-8")
+        render_meta = script[script.index("function renderMeta") : script.index("function visibleSectors")]
+        self.assertIn('const closed = payload.mode === "closed"', render_meta)
+        self.assertIn('? "收盘快照"', render_meta)
+        self.assertNotIn('["historical_replay", "cached_replay", "closed"]', render_meta)
 
 
 class EastmoneyProviderPaginationTest(unittest.TestCase):
