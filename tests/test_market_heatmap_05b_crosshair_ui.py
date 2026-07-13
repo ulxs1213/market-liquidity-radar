@@ -53,10 +53,11 @@ class MarketHeatmap05BCrosshairTest(unittest.TestCase):
         self.assertNotIn('主力总流入', STOCK_TIMELINE)
         self.assertNotIn('主力总流出', STOCK_TIMELINE)
 
-    def test_live_redraw_retains_hover_and_avoids_full_chart_recreation(self) -> None:
-        self.assertIn("stockHoverActive", STOCK_TIMELINE)
-        self.assertIn("stockHoverTime", STOCK_TIMELINE)
-        self.assertIn('dispatchAction({ type: "showTip", seriesIndex, dataIndex: hoverIndex })', STOCK_TIMELINE)
+    def test_live_redraw_uses_stable_instance_without_programmatic_showtip_race(self) -> None:
+        self.assertIn('lazyUpdate: false, silent: true', STOCK_TIMELINE)
+        self.assertNotIn('dispatchAction({ type: "showTip"', STOCK_TIMELINE)
+        self.assertIn('stockTimelineChart.getZr().trigger("globalout", { event: {} })', STOCK_TIMELINE)
+        self.assertIn('stockTimelineChart.dispatchAction({ type: "hideTip" })', STOCK_TIMELINE)
         self.assertIn('transitionDuration: 0', STOCK_TIMELINE)
         self.assertIn('notMerge: false', STOCK_TIMELINE)
         self.assertIn('replaceMerge: ["grid", "xAxis", "yAxis", "series"]', STOCK_TIMELINE)

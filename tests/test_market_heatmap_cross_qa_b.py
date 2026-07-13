@@ -6,9 +6,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-HTML = (ROOT / "src" / "market_liquidity_radar" / "web" / "index.html").read_text(encoding="utf-8")
-CSS = (ROOT / "src" / "market_liquidity_radar" / "web" / "static" / "market_heatmap.css").read_text(encoding="utf-8")
-JS = (ROOT / "src" / "market_liquidity_radar" / "web" / "static" / "market_heatmap.js").read_text(encoding="utf-8")
+WEB = ROOT / "src" / "market_liquidity_radar" / "web"
+HTML = (WEB / "index.html").read_text(encoding="utf-8")
+CSS = (WEB / "static" / "market_heatmap.css").read_text(encoding="utf-8")
+JS = (WEB / "static" / "market_heatmap.js").read_text(encoding="utf-8")
 TIMELINE = JS[JS.index("function renderStockTimeline") : JS.index("function renderOrderBook")]
 
 
@@ -38,25 +39,32 @@ def _theme_variables(theme: str) -> tuple[str, dict[str, str]]:
 
 
 class MarketHeatmapCrossQaBTest(unittest.TestCase):
-    def test_t1_has_exactly_three_light_and_four_dark_themes(self) -> None:
+    def test_t1_has_nine_presets_plus_custom_in_product_order(self) -> None:
         buttons = re.findall(r'data-theme-choice="([^"]+)"', HTML)
-        self.assertEqual(buttons, ["cloud", "mist", "sand", "ink", "slate", "midnight", "terminal"])
-        schemes = [_theme_variables(theme)[0] for theme in buttons]
-        self.assertEqual(schemes.count("light"), 3)
-        self.assertEqual(schemes.count("dark"), 4)
-        self.assertEqual(JS.count('const THEMES = ["cloud", "mist", "sand", "ink", "slate", "midnight", "terminal"]'), 1)
+        self.assertEqual(
+            buttons,
+            ["cloud", "mist", "sand", "ink", "slate", "midnight", "red", "rose", "prismatic", "custom"],
+        )
+        preset_schemes = [_theme_variables(theme)[0] for theme in buttons[:-1]]
+        self.assertEqual(preset_schemes.count("light"), 5)
+        self.assertEqual(preset_schemes.count("dark"), 4)
+        self.assertEqual(_theme_variables("custom")[0], "light")
+        self.assertEqual(
+            JS.count('const THEMES = ["cloud", "mist", "sand", "ink", "slate", "midnight", "red", "rose", "prismatic", "custom"]'),
+            1,
+        )
 
     def test_t1_theme_persistence_aria_and_legacy_aliases_are_wired(self) -> None:
-        self.assertIn('const THEME_ALIASES = { ocean: "midnight", violet: "slate" }', JS)
+        self.assertIn('const THEME_ALIASES = { ocean: "midnight", violet: "slate", terminal: "midnight" }', JS)
         self.assertIn("localStorage.setItem(PREF_KEY", JS)
         self.assertIn("const savedTheme = THEME_ALIASES[saved.theme] || saved.theme", JS)
         self.assertIn("document.documentElement.dataset.theme = STATE.theme", JS)
         self.assertIn('button.setAttribute("aria-pressed", String(active))', JS)
-        for theme in ("cloud", "mist", "sand", "ink", "slate", "midnight", "terminal"):
+        for theme in ("cloud", "mist", "sand", "ink", "slate", "midnight", "red", "rose", "prismatic", "custom"):
             self.assertIn(f'[data-theme-choice="{theme}"]', CSS)
 
     def test_t1_body_and_secondary_text_meet_wcag_aa_on_dashboard_surfaces(self) -> None:
-        for theme in ("cloud", "mist", "sand", "ink", "slate", "midnight", "terminal"):
+        for theme in ("cloud", "mist", "sand", "ink", "slate", "midnight", "red", "rose", "prismatic", "custom"):
             _scheme, values = _theme_variables(theme)
             self.assertGreaterEqual(_contrast(values["text"], values["panel"]), 7.0, theme)
             for surface in ("panel", "surface", "control"):
@@ -82,8 +90,10 @@ class MarketHeatmapCrossQaBTest(unittest.TestCase):
 
     def test_c2_hover_survives_refresh_and_same_chart_dom_move(self) -> None:
         self.assertIn("if (timelineSignature !== STATE.lastStockTimelineSignature)", TIMELINE)
-        self.assertIn("STATE.stockHoverActive && hoverIndex >= 0", TIMELINE)
-        self.assertIn('dispatchAction({ type: "showTip", seriesIndex, dataIndex: hoverIndex })', TIMELINE)
+        self.assertIn('lazyUpdate: false, silent: true', TIMELINE)
+        self.assertNotIn('dispatchAction({ type: "showTip"', TIMELINE)
+        self.assertIn('stockTimelineChart.getZr().trigger("globalout", { event: {} })', TIMELINE)
+        self.assertIn('stockTimelineChart.dispatchAction({ type: "hideTip" })', TIMELINE)
         self.assertIn("if (STATE.interacting)", JS)
         self.assertIn("STATE.deferredPayload = payload", JS)
         self.assertEqual(JS.count('echarts.init($("stockTimeline"))'), 1)
