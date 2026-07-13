@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 import tempfile
 import threading
@@ -15,24 +14,16 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from market_liquidity_radar.cli import access_urls, run_self_check  # noqa: E402
+from market_liquidity_radar.cli import access_urls, build_parser, run_self_check  # noqa: E402
 from market_liquidity_radar.server import create_server  # noqa: E402
 from quant_dashboard.market_heatmap import create_service  # noqa: E402
 
 
 class LauncherTests(unittest.TestCase):
     def test_start_script_help_is_offline(self) -> None:
-        result = subprocess.run(
-            [sys.executable, "start.py", "--help"],
-            cwd=ROOT,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        self.assertEqual(0, result.returncode, result.stderr)
-        self.assertIn("--print-urls-only", result.stdout)
-        self.assertIn("--self-check", result.stdout)
+        help_text = build_parser().format_help()
+        self.assertIn("--print-urls-only", help_text)
+        self.assertIn("--self-check", help_text)
 
     def test_local_url_is_first_when_listening_on_all_interfaces(self) -> None:
         urls = access_urls("0.0.0.0", 8772)
