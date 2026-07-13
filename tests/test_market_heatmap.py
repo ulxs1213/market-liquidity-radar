@@ -527,6 +527,10 @@ class MarketHeatmapServiceTest(unittest.TestCase):
             self.assertIn(speed, html)
         for state_function in ("loadReplayCatalog", "loadReplayFrame", "setReplayPlaying", "returnToLive"):
             self.assertIn(f"function {state_function}", script)
+        return_live = script[script.index("async function returnToLive") : script.index("async function refreshRace")]
+        self.assertIn("const selectedCode = STATE.selectedCode", return_live)
+        self.assertIn("await refresh(true)", return_live)
+        self.assertIn("await selectSector(selectedCode, true)", return_live)
         self.assertIn("stock_only_frame_labels", script)
         self.assertIn('if (!STATE.paused && !STATE.replayMode)', script)
         self.assertIn('/api/market_heatmap/replay_manifest', server)

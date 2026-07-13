@@ -1098,8 +1098,9 @@
       return null;
     }
   }
-  function returnToLive() {
+  async function returnToLive() {
     setReplayPlaying(false);
+    const selectedCode = STATE.selectedCode;
     STATE.replayMode = false;
     STATE.replayRequestSeq += 1;
     STATE.raceTradeDate = "";
@@ -1110,7 +1111,13 @@
     $("replayLive").disabled = true;
     STATE.lastHeavyFetchAt = 0;
     STATE.lastRaceSignature = "";
-    refresh(true);
+    await refresh(true);
+    // A replay frame may legitimately have no historical classification and
+    // therefore clears module 04.  Re-query the selected live sector after the
+    // live snapshot is back instead of leaving the historical empty state.
+    if (!STATE.replayMode && selectedCode && STATE.selectedCode === selectedCode) {
+      await selectSector(selectedCode, true);
+    }
   }
   async function refreshRace(force = false) {
     if (STATE.replayMode) {
