@@ -25,11 +25,20 @@
     liquidityColorMode: "industry",
     liquidityLimit: 50,
     theme: "cloud",
+    customTheme: { name: "我的主题", hex: "#d84a68", hue: 350, saturation: 66, value: 85, mode: "light" },
+    customThemeSaved: { name: "我的主题", hex: "#d84a68", hue: 350, saturation: 66, value: 85, mode: "light" },
+    customThemePrevious: "cloud",
+    customThemeDragging: false,
+    customThemeFrame: 0,
     showAuction: false,
     currentStockPayload: null,
     stockHoverActive: false,
     stockHoverTime: "",
     lastStockTimelineSignature: "",
+    stockThemeRefreshTimer: 0,
+    stockThemeRefreshNotBefore: 0,
+    themeChartRefreshTimer: 0,
+    themeChartRefreshNotBefore: 0,
     sparklines: new Map(),
     sparkRequestSeq: 0,
     selectedSectorDetail: null,
@@ -67,8 +76,10 @@
   const COUNT_CHOICES = [10, 20, 30, 0];
   const RACE_CHOICES = [5, 10, 20, 0];
   const LIQUIDITY_CHOICES = [30, 50, 100, 200, 500];
-  const THEMES = ["cloud", "mist", "sand", "ink", "slate", "midnight", "terminal"];
-  const THEME_ALIASES = { ocean: "midnight", violet: "slate" };
+  const THEMES = ["cloud", "mist", "sand", "ink", "slate", "midnight", "red", "rose", "prismatic", "custom"];
+  const THEME_ALIASES = { ocean: "midnight", violet: "slate", terminal: "midnight" };
+  const DEFAULT_CUSTOM_THEME = Object.freeze({ name: "我的主题", hex: "#d84a68", hue: 350, saturation: 66, value: 85, mode: "light" });
+  const CUSTOM_THEME_PROPERTIES = ["--bg", "--bg-accent", "--panel", "--panel-2", "--panel-gradient-a", "--panel-gradient-b", "--surface", "--control", "--topbar", "--line", "--line-soft", "--text", "--muted", "--mint", "--mint-2", "--up", "--down", "--amber", "--panel-shadow", "--overlay", "--status-bg", "--dialog-bg"];
   const DETAIL_LABELS = ["简洁", "标准", "详细"];
   const LAYOUT_KEY = "market-liquidity-radar-layout-v1";
   const PREF_KEY = "market-liquidity-radar-preferences-v2";
@@ -88,6 +99,140 @@
     return `${Object.is(rounded, -0) ? 0 : rounded}亿`;
   };
   const fmtPct = (value) => `${Number(value || 0) >= 0 ? "+" : ""}${Number(value || 0).toFixed(2)}%`;
+  const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, Number(value)));
+  const normalizeHex = value => {
+    const raw = String(value || "").trim().replace(/^#/, "");
+    if (/^[0-9a-f]{3}$/i.test(raw)) return `#${raw.split("").map(char => char + char).join("")}`.toLowerCase();
+    return /^[0-9a-f]{6}$/i.test(raw) ? `#${raw.toLowerCase()}` : "";
+  };
+  const hexToRgb = value => {
+    const hex = normalizeHex(value) || DEFAULT_CUSTOM_THEME.hex;
+    return [1, 3, 5].map(index => Number.parseInt(hex.slice(index, index + 2), 16));
+  };
+  const rgbToHex = rgb => `#${rgb.map(value => Math.round(clamp(value, 0, 255)).toString(16).padStart(2, "0")).join("")}`;
+  const hsvToHex = (hue, saturation, value) => {
+    const h = ((Number(hue) % 360) + 360) % 360;
+    const s = clamp(saturation, 0, 100) / 100;
+    const v = clamp(value, 0, 100) / 100;
+    const chroma = v * s;
+    const section = h / 60;
+    const x = chroma * (1 - Math.abs(section % 2 - 1));
+    const [r1, g1, b1] = section < 1 ? [chroma, x, 0] : section < 2 ? [x, chroma, 0] : section < 3 ? [0, chroma, x] : section < 4 ? [0, x, chroma] : section < 5 ? [x, 0, chroma] : [chroma, 0, x];
+    const offset = v - chroma;
+    return rgbToHex([(r1 + offset) * 255, (g1 + offset) * 255, (b1 + offset) * 255]);
+  };
+  const hexToHsv = value => {
+    const [red, green, blue] = hexToRgb(value).map(channel => channel / 255);
+    const maximum = Math.max(red, green, blue);
+    const minimum = Math.min(red, green, blue);
+    const delta = maximum - minimum;
+    let hue = 0;
+    if (delta) {
+      if (maximum === red) hue = 60 * (((green - blue) / delta) % 6);
+      else if (maximum === green) hue = 60 * ((blue - red) / delta + 2);
+      else hue = 60 * ((red - green) / delta + 4);
+    }
+    return { hue: Math.round((hue + 360) % 360), saturation: Math.round(maximum ? delta / maximum * 100 : 0), value: Math.round(maximum * 100) };
+  };
+  const mixHex = (from, to, amount) => {
+    const start = hexToRgb(from);
+    const end = hexToRgb(to);
+    const weight = clamp(amount, 0, 1);
+    return rgbToHex(start.map((value, index) => value + (end[index] - value) * weight));
+  };
+  const relativeLuminance = value => {
+    const channels = hexToRgb(value).map(channel => {
+      const normalized = channel / 255;
+      return normalized <= .04045 ? normalized / 12.92 : ((normalized + .055) / 1.055) ** 2.4;
+    });
+    return .2126 * channels[0] + .7152 * channels[1] + .0722 * channels[2];
+  };
+  const contrastRatio = (foreground, background) => {
+    const values = [relativeLuminance(foreground), relativeLuminance(background)].sort((a, b) => b - a);
+    return (values[0] + .05) / (values[1] + .05);
+  };
+  const contrastSafeColor = (color, surfaces, toward, minimum = 4.5) => {
+    const backgrounds = Array.isArray(surfaces) ? surfaces : [surfaces];
+    const passes = candidate => backgrounds.every(surface => contrastRatio(candidate, surface) >= minimum);
+    if (passes(color)) return color;
+    for (let step = 1; step <= 24; step += 1) {
+      const candidate = mixHex(color, toward, step / 24);
+      if (passes(candidate)) return candidate;
+    }
+    return toward;
+  };
+  const sanitizeCustomTheme = value => {
+    const input = value && typeof value === "object" ? value : {};
+    const hex = normalizeHex(input.hex) || DEFAULT_CUSTOM_THEME.hex;
+    const derived = hexToHsv(hex);
+    return {
+      name: String(input.name || DEFAULT_CUSTOM_THEME.name).trim().slice(0, 12) || DEFAULT_CUSTOM_THEME.name,
+      hex,
+      hue: clamp(Number.isFinite(Number(input.hue)) ? input.hue : derived.hue, 0, 359),
+      saturation: clamp(Number.isFinite(Number(input.saturation)) ? input.saturation : derived.saturation, 0, 100),
+      value: clamp(Number.isFinite(Number(input.value)) ? input.value : derived.value, 0, 100),
+      mode: input.mode === "dark" ? "dark" : "light",
+    };
+  };
+  const customThemeTokens = rawTheme => {
+    const theme = sanitizeCustomTheme(rawTheme);
+    const accent = theme.hex;
+    const companion = hsvToHex((theme.hue + 46) % 360, Math.max(30, theme.saturation * .72), theme.mode === "dark" ? 76 : 72);
+    if (theme.mode === "dark") {
+      const bg = mixHex(accent, "#08070a", .94);
+      const bgAccent = mixHex(companion, "#08070a", .94);
+      const panel = mixHex(accent, "#151217", .92);
+      const panel2 = mixHex(accent, "#1b171d", .89);
+      const surface = mixHex(accent, "#0f0c11", .94);
+      const control = mixHex(accent, "#211c23", .90);
+      const visibleAccent = contrastSafeColor(accent, [panel, bg], "#ffffff");
+      return { companion, tokens: {
+        "--bg": bg, "--bg-accent": bgAccent, "--panel": panel, "--panel-2": panel2,
+        "--panel-gradient-a": panel, "--panel-gradient-b": mixHex(companion, "#171319", .91),
+        "--surface": surface, "--control": control, "--topbar": panel,
+        "--line": mixHex(panel, "#ffffff", .19), "--line-soft": `color-mix(in srgb,${mixHex(panel, "#ffffff", .19)} 76%,transparent)`,
+        "--text": "#fff4f6", "--muted": "#cdb9c0", "--mint": visibleAccent, "--mint-2": mixHex(visibleAccent, panel, .52),
+        "--up": "#ff7b72", "--down": "#55c69a", "--amber": "#e5b968", "--panel-shadow": "0 1px 3px rgba(0,0,0,.30)",
+        "--overlay": "rgba(5,2,4,.74)", "--status-bg": `color-mix(in srgb,${visibleAccent} 11%,transparent)`, "--dialog-bg": panel,
+      } };
+    }
+    const bg = mixHex(accent, "#ffffff", .94);
+    const bgAccent = mixHex(companion, "#ffffff", .94);
+    const panel = mixHex(accent, "#ffffff", .985);
+    const panel2 = mixHex(accent, "#ffffff", .95);
+    const surface = mixHex(accent, "#ffffff", .97);
+    const control = mixHex(accent, "#ffffff", .93);
+    const visibleAccent = contrastSafeColor(accent, [panel, bg], "#000000");
+    return { companion, tokens: {
+      "--bg": bg, "--bg-accent": bgAccent, "--panel": panel, "--panel-2": panel2,
+      "--panel-gradient-a": panel, "--panel-gradient-b": mixHex(companion, "#ffffff", .965),
+      "--surface": surface, "--control": control, "--topbar": panel,
+      "--line": mixHex("#30272b", "#ffffff", .74), "--line-soft": `color-mix(in srgb,${mixHex("#30272b", "#ffffff", .74)} 76%,transparent)`,
+      "--text": "#30272b", "--muted": "#6d5c63", "--mint": visibleAccent, "--mint-2": mixHex(visibleAccent, "#ffffff", .58),
+      "--up": "#c7253e", "--down": "#237a5b", "--amber": "#976117", "--panel-shadow": "0 1px 3px rgba(77,42,51,.08)",
+      "--overlay": "rgba(48,39,43,.43)", "--status-bg": `color-mix(in srgb,${visibleAccent} 8%,transparent)`, "--dialog-bg": panel,
+    } };
+  };
+  const clearCustomThemeVars = () => {
+    CUSTOM_THEME_PROPERTIES.forEach(property => document.documentElement.style.removeProperty(property));
+    document.documentElement.style.removeProperty("color-scheme");
+  };
+  const applyCustomThemeVars = rawTheme => {
+    const theme = sanitizeCustomTheme(rawTheme);
+    const { tokens } = customThemeTokens(theme);
+    CUSTOM_THEME_PROPERTIES.forEach(property => document.documentElement.style.setProperty(property, tokens[property]));
+    document.documentElement.style.setProperty("color-scheme", theme.mode);
+    return theme;
+  };
+  const chartTheme = () => {
+    const style = getComputedStyle(document.documentElement);
+    const token = (name, fallback) => style.getPropertyValue(name).trim() || fallback;
+    return {
+      text: token("--text", "#e8f3ef"), muted: token("--muted", "#8ca59e"), panel: token("--panel", "#07110f"),
+      surface: token("--surface", "#0d1d1a"), line: token("--line", "#295249"), mint: token("--mint", "#35d7b2"),
+      mint2: token("--mint-2", "#24423d"), up: token("--up", "#e95f55"), down: token("--down", "#27b48f"), amber: token("--amber", "#efb85b"),
+    };
+  };
   const esc = (value) => String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
   const fmtMetric = (row, metric) => {
     if (metric === "delta_flow") return fmtMoney(row[metric]);
@@ -263,6 +408,7 @@
     ));
   }
   function renderSectorTreemap() {
+    const palette = chartTheme();
     const rows = topFlowSectors(visibleSectors(), STATE.heatmapLimit);
     const sizeMetric = $("sizeMetric").value;
     const colorMetric = $("colorMetric").value;
@@ -270,7 +416,7 @@
     if (!rows.length) {
       sectorChart.clear();
       sectorChart.setOption({
-        title: { text: "没有匹配的板块", subtext: "清除筛选词或切换板块类型", left: "center", top: "42%", textStyle: { color: "#9db5ae", fontSize: 15 }, subtextStyle: { color: "#617c75", fontSize: 11 } },
+        title: { text: "没有匹配的板块", subtext: "清除筛选词或切换板块类型", left: "center", top: "42%", textStyle: { color: palette.text, fontSize: 15 }, subtextStyle: { color: palette.muted, fontSize: 11 } },
       });
       return;
     }
@@ -280,16 +426,17 @@
       name: row.name,
       code: row.code,
       value: [Math.max(1, sizeMetric === "abs_flow" ? Math.abs(row.main_net_inflow) : row.amount), row[colorMetric]],
-      itemStyle: { color: colorBy(row[colorMetric], maxAbs), borderColor: "#07100f", borderWidth: 2 },
+      itemStyle: { color: colorBy(row[colorMetric], maxAbs), borderColor: palette.panel, borderWidth: 2 },
       raw: row,
     }));
     sectorChart.setOption({
       animation: false,
-      tooltip: { backgroundColor: "#07110f", borderColor: "#295249", textStyle: { color: "#e8f3ef" }, formatter: p => { const r = p?.data?.raw; if (!r) return esc(p?.name || ""); return `<b>${r.name}</b> ${r.code}<br>涨跌 ${fmtPct(r.change_pct)}<br>成交额 ${fmtMoney(r.amount)}<br>主力净流 ${fmtMoney(r.main_net_inflow)} (${fmtPct(r.main_net_ratio)})<br>3秒增量 ${fmtMoney(r.delta_flow)}<br>上涨/下跌 ${r.rise_count}/${r.fall_count}<br>强弱分 ${r.strength_score.toFixed(2)}`; } },
+      tooltip: { backgroundColor: palette.panel, borderColor: palette.line, textStyle: { color: palette.text }, formatter: p => { const r = p?.data?.raw; if (!r) return esc(p?.name || ""); return `<b>${r.name}</b> ${r.code}<br>涨跌 ${fmtPct(r.change_pct)}<br>成交额 ${fmtMoney(r.amount)}<br>主力净流 ${fmtMoney(r.main_net_inflow)} (${fmtPct(r.main_net_ratio)})<br>3秒增量 ${fmtMoney(r.delta_flow)}<br>上涨/下跌 ${r.rise_count}/${r.fall_count}<br>强弱分 ${r.strength_score.toFixed(2)}`; } },
       series: [{ type: "treemap", roam: false, nodeClick: false, breadcrumb: { show: false }, sort: "desc", data, label: { show: true, color: "#f4fbf8", formatter: p => { const r = p?.data?.raw; if (!r) return ""; if (STATE.heatmapDetail === 0) return `{name|${r.name}}\n{flow|${fmtMoney(r.main_net_inflow)}}`; if (STATE.heatmapDetail === 1) return `{name|${r.name}}\n{val|${fmtPct(r.change_pct)}}\n{flow|${fmtMoney(r.main_net_inflow)}}`; return `{name|${r.name}}\n{code|${r.code}}\n{val|${fmtMetric(r, colorMetric)}}\n{flow|${fmtMoney(r.main_net_inflow)}}\n{ratio|占比 ${fmtPct(r.main_net_ratio)}}`; }, rich: { name: { fontSize: 13, fontWeight: 700, lineHeight: 19 }, code: { fontSize: 9, color: "#b9ccc7", lineHeight: 15 }, val: { fontSize: 11, lineHeight: 16 }, flow: { fontSize: 9, color: "#d2e1dd" }, ratio: { fontSize: 8, color: "#8eaaa3" } } }, upperLabel: { show: false }, levels: [{ itemStyle: { gapWidth: 2, borderWidth: 1 } }] }],
     }, { notMerge: false, replaceMerge: ["series"], lazyUpdate: true, silent: true });
   }
   function renderStocks(payload) {
+    const palette = chartTheme();
     STATE.selectedSectorDetail = payload;
     STATE.selectedSectorDetailCode = payload.code || payload.sector_code || STATE.selectedCode;
     const allStocks = [...(payload.stocks || [])].sort((a, b) => b.amount - a.amount);
@@ -299,8 +446,8 @@
     const maxChange = Math.max(1, ...stocks.map(row => Math.abs(row.change_pct)));
     stockChart.setOption({
       animation: false,
-      tooltip: { backgroundColor: "#07110f", borderColor: "#295249", formatter: p => { const r = p?.data?.raw; if (!r) return esc(p?.name || ""); return `<b>${r.name}</b> ${r.code}.${r.market}<br>涨跌 ${fmtPct(r.change_pct)}<br>成交额 ${fmtMoney(r.amount)}<br>量比 ${r.volume_ratio.toFixed(2)} · 换手 ${fmtPct(r.turnover_pct)}<br>主力净流 ${fmtMoney(r.main_net_inflow)}`; } },
-      series: [{ type: "treemap", roam: false, nodeClick: false, breadcrumb: { show: false }, data: stocks.map(row => ({ name: row.name, value: Math.max(1, row.amount), raw: row, itemStyle: { color: colorBy(row.change_pct, maxChange), borderColor: "#07100f", borderWidth: 2 } })), label: { color: "#f1faf7", formatter: p => { const r = p?.data?.raw; if (!r) return ""; if (STATE.stockDetail === 0) return `${r.name}\n${fmtMoney(r.amount)}`; if (STATE.stockDetail === 1) return `${r.name}\n${fmtPct(r.change_pct)}\n${fmtMoney(r.amount)}`; return `${r.name} ${r.code}\n${fmtPct(r.change_pct)} · 量比${Number(r.volume_ratio || 0).toFixed(2)}\n${fmtMoney(r.amount)} · 净流${fmtMoney(r.main_net_inflow)}`; } } }],
+      tooltip: { backgroundColor: palette.panel, borderColor: palette.line, textStyle: { color: palette.text }, formatter: p => { const r = p?.data?.raw; if (!r) return esc(p?.name || ""); return `<b>${r.name}</b> ${r.code}.${r.market}<br>涨跌 ${fmtPct(r.change_pct)}<br>成交额 ${fmtMoney(r.amount)}<br>量比 ${r.volume_ratio.toFixed(2)} · 换手 ${fmtPct(r.turnover_pct)}<br>主力净流 ${fmtMoney(r.main_net_inflow)}`; } },
+      series: [{ type: "treemap", roam: false, nodeClick: false, breadcrumb: { show: false }, data: stocks.map(row => ({ name: row.name, value: Math.max(1, row.amount), raw: row, itemStyle: { color: colorBy(row.change_pct, maxChange), borderColor: palette.panel, borderWidth: 2 } })), label: { color: "#f1faf7", formatter: p => { const r = p?.data?.raw; if (!r) return ""; if (STATE.stockDetail === 0) return `${r.name}\n${fmtMoney(r.amount)}`; if (STATE.stockDetail === 1) return `${r.name}\n${fmtPct(r.change_pct)}\n${fmtMoney(r.amount)}`; return `${r.name} ${r.code}\n${fmtPct(r.change_pct)} · 量比${Number(r.volume_ratio || 0).toFixed(2)}\n${fmtMoney(r.amount)} · 净流${fmtMoney(r.main_net_inflow)}`; } } }],
     }, { notMerge: false, replaceMerge: ["series"], lazyUpdate: true, silent: true });
   }
   function renderSourceCatalog(payload) {
@@ -325,6 +472,7 @@
     $("sourceWarning").textContent = `口径边界：${overlap}；新股处理：${exclusion}。`;
   }
   function renderRace(payload) {
+    const palette = chartTheme();
     STATE.racePayload = payload;
     const populated = (payload.series || []).filter(row => (row.points || []).length);
     STATE.raceDates = payload.available_dates || [];
@@ -400,7 +548,7 @@
       type: "category",
       data: allTimes,
       boundaryGap: false,
-      axisLine: { lineStyle: { color: "#24423d" } },
+      axisLine: { lineStyle: { color: palette.line } },
       splitLine: { show: false },
     };
     const grids = independentScale
@@ -412,15 +560,15 @@
     const xAxes = independentScale
       ? [
           { ...axisBase, gridIndex: 0, axisLabel: { show: false }, axisTick: { show: false } },
-          { ...axisBase, gridIndex: 1, axisLabel: { color: "#708b84", formatter: value => value, hideOverlap: true } },
+          { ...axisBase, gridIndex: 1, axisLabel: { color: palette.muted, formatter: value => value, hideOverlap: true } },
         ]
-      : [{ ...axisBase, gridIndex: 0, axisLabel: { color: "#708b84", formatter: value => value, hideOverlap: true } }];
+      : [{ ...axisBase, gridIndex: 0, axisLabel: { color: palette.muted, formatter: value => value, hideOverlap: true } }];
     const yAxes = independentScale
       ? [
-          { type: "value", gridIndex: 0, scale: true, name: "净流入（亿）", nameLocation: "middle", nameRotate: 90, nameGap: 72, nameTextStyle: { color: "#b85854", fontWeight: 700 }, axisLabel: { color: "#b85854", formatter: fmtYiInteger, hideOverlap: true, margin: 10 }, axisLine: { show: true, lineStyle: { color: "rgba(184,88,84,.45)" } }, splitLine: { lineStyle: { color: "rgba(176,82,78,.18)" } } },
-          { type: "value", gridIndex: 1, scale: true, name: "净流出（亿）", nameLocation: "middle", nameRotate: 90, nameGap: 72, nameTextStyle: { color: "#398b76", fontWeight: 700 }, axisLabel: { color: "#398b76", formatter: fmtYiInteger, hideOverlap: true, margin: 10 }, axisLine: { show: true, lineStyle: { color: "rgba(57,139,118,.45)" } }, splitLine: { lineStyle: { color: "rgba(45,135,110,.18)" } } },
+          { type: "value", gridIndex: 0, scale: true, name: "净流入（亿）", nameLocation: "middle", nameRotate: 90, nameGap: 72, nameTextStyle: { color: palette.up, fontWeight: 700 }, axisLabel: { color: palette.up, formatter: fmtYiInteger, hideOverlap: true, margin: 10 }, axisLine: { show: true, lineStyle: { color: palette.up } }, splitLine: { lineStyle: { color: palette.line } } },
+          { type: "value", gridIndex: 1, scale: true, name: "净流出（亿）", nameLocation: "middle", nameRotate: 90, nameGap: 72, nameTextStyle: { color: palette.down, fontWeight: 700 }, axisLabel: { color: palette.down, formatter: fmtYiInteger, hideOverlap: true, margin: 10 }, axisLine: { show: true, lineStyle: { color: palette.down } }, splitLine: { lineStyle: { color: palette.line } } },
         ]
-      : [{ type: "value", gridIndex: 0, scale: true, name: payload.data_mode === "historical_direction_proxy" ? "成交方向代理（亿）" : "主力净流（亿）", nameLocation: "middle", nameRotate: 90, nameGap: 72, nameTextStyle: { color: "#78938c", fontWeight: 700 }, axisLabel: { color: "#708b84", formatter: fmtYiInteger, hideOverlap: true, margin: 10 }, axisLine: { show: true, lineStyle: { color: "#78938c" } }, splitLine: { lineStyle: { color: "rgba(45,75,69,.30)" } } }];
+      : [{ type: "value", gridIndex: 0, scale: true, name: payload.data_mode === "historical_direction_proxy" ? "成交方向代理（亿）" : "主力净流（亿）", nameLocation: "middle", nameRotate: 90, nameGap: 72, nameTextStyle: { color: palette.muted, fontWeight: 700 }, axisLabel: { color: palette.muted, formatter: fmtYiInteger, hideOverlap: true, margin: 10 }, axisLine: { show: true, lineStyle: { color: palette.line } }, splitLine: { lineStyle: { color: palette.line } } }];
     const seriesMeta = new Map(series.map(item => [item.id, item]));
     timelineChart.setOption({
       animation: false,
@@ -430,9 +578,9 @@
         trigger: "axis",
         order: "valueDesc",
         confine: true,
-        backgroundColor: "rgba(5,15,13,.96)",
-        borderColor: "#295249",
-        textStyle: { fontSize: 11 },
+        backgroundColor: palette.panel,
+        borderColor: palette.line,
+        textStyle: { color: palette.text, fontSize: 11 },
         formatter: params => {
           const rows = Array.isArray(params) ? params : [params];
           const time = rows[0]?.axisValueLabel || rows[0]?.axisValue || "--";
@@ -464,6 +612,20 @@
   }
   function renderStockTimeline(payload) {
     STATE.currentStockPayload = payload;
+    const themeRefreshWait = STATE.stockThemeRefreshNotBefore - Date.now();
+    if (themeRefreshWait > 0) {
+      clearTimeout(STATE.stockThemeRefreshTimer);
+      STATE.stockThemeRefreshTimer = setTimeout(() => {
+        STATE.stockThemeRefreshTimer = 0;
+        STATE.stockThemeRefreshNotBefore = 0;
+        STATE.lastStockTimelineSignature = "";
+        stockTimelineChart.getZr().trigger("globalout", { event: {} });
+        stockTimelineChart.dispatchAction({ type: "hideTip" });
+        if (STATE.currentStockPayload) renderStockTimeline(STATE.currentStockPayload);
+      }, themeRefreshWait + 24);
+      return;
+    }
+    const palette = chartTheme();
     const auction = payload.auction || {};
     const includeAuction = Boolean(STATE.showAuction && auction.available);
     const auctionToggle = $("auctionToggle");
@@ -531,53 +693,50 @@
     }).join(";")}`;
     if (timelineSignature !== STATE.lastStockTimelineSignature) {
       STATE.lastStockTimelineSignature = timelineSignature;
+      stockTimelineChart.getZr().trigger("globalout", { event: {} });
+      stockTimelineChart.dispatchAction({ type: "hideTip" });
       stockTimelineChart.setOption({
       animation: false,
       axisPointer: {
         link: [{ xAxisIndex: [0, 1, 2] }],
-        lineStyle: { color: "#b5c9c3", width: 1, type: "dashed" },
-        label: { show: true, backgroundColor: "#24423d", color: "#f2faf7" },
+        lineStyle: { color: palette.muted, width: 1, type: "dashed" },
+        label: { show: true, backgroundColor: palette.surface, color: palette.text },
       },
       tooltip: {
         trigger: "axis",
         triggerOn: "mousemove|click",
         confine: true,
         transitionDuration: 0,
-        backgroundColor: "rgba(7,17,15,.97)",
-        borderColor: "#4b7369",
-        textStyle: { color: "#e8f3ef", fontSize: 11, lineHeight: 18 },
+        backgroundColor: palette.panel,
+        borderColor: palette.line,
+        textStyle: { color: palette.text, fontSize: 11, lineHeight: 18 },
         axisPointer: { type: "line", axis: "x", snap: true, animation: false },
         formatter: tooltipFormatter,
       },
-      legend: { top: 5, data: ["最新价", "当日均价", "分钟成交量", "累计主力净流", "资金分钟变化"], textStyle: { color: "#8ca59e", fontSize: 10 } },
+      legend: { top: 5, data: ["最新价", "当日均价", "分钟成交量", "累计主力净流", "资金分钟变化"], textStyle: { color: palette.muted, fontSize: 10 } },
       grid: [
         { left: 66, right: 64, top: 42, height: "48%" },
         { left: 66, right: 64, top: "61%", height: "12%" },
         { left: 66, right: 64, top: "78%", bottom: 34 },
       ],
       xAxis: [
-        { type: "category", data: categories, boundaryGap: false, axisPointer: { show: true, type: "line", snap: true }, axisLabel: { show: false }, axisLine: { lineStyle: { color: "#24423d" } } },
+        { type: "category", data: categories, boundaryGap: false, axisPointer: { show: true, type: "line", snap: true }, axisLabel: { show: false }, axisLine: { lineStyle: { color: palette.line } } },
         { type: "category", gridIndex: 1, data: categories, boundaryGap: false, axisPointer: { show: true, type: "line", snap: true }, axisLabel: { show: false }, axisLine: { show: false } },
-        { type: "category", gridIndex: 2, data: categories, boundaryGap: false, axisPointer: { show: true, type: "line", snap: true }, axisLabel: { color: "#708b84", hideOverlap: true }, axisLine: { lineStyle: { color: "#24423d" } } },
+        { type: "category", gridIndex: 2, data: categories, boundaryGap: false, axisPointer: { show: true, type: "line", snap: true }, axisLabel: { color: palette.muted, hideOverlap: true }, axisLine: { lineStyle: { color: palette.line } } },
       ],
       yAxis: [
-        { type: "value", scale: true, name: "价格", nameTextStyle: { color: "#6f8c84" }, axisLabel: { color: "#708b84" }, splitLine: { lineStyle: { color: "rgba(45,75,69,.35)" } } },
-        { type: "value", gridIndex: 1, name: `成交量（${volumeUnit}）`, nameTextStyle: { color: "#6f8c84" }, axisLabel: { color: "#708b84", formatter: v => fmtMoney(v) }, splitLine: { show: false } },
-        { type: "value", gridIndex: 2, name: payload.data_mode === "historical_direction_proxy" ? "资金代理" : "主力资金", nameTextStyle: { color: "#6f8c84" }, axisLabel: { color: "#708b84", formatter: v => fmtMoney(v) }, splitLine: { lineStyle: { color: "rgba(45,75,69,.28)" } } },
+        { type: "value", scale: true, name: "价格", nameTextStyle: { color: palette.muted }, axisLabel: { color: palette.muted }, splitLine: { lineStyle: { color: palette.line } } },
+        { type: "value", gridIndex: 1, name: `成交量（${volumeUnit}）`, nameTextStyle: { color: palette.muted }, axisLabel: { color: palette.muted, formatter: v => fmtMoney(v) }, splitLine: { show: false } },
+        { type: "value", gridIndex: 2, name: payload.data_mode === "historical_direction_proxy" ? "资金代理" : "主力资金", nameTextStyle: { color: palette.muted }, axisLabel: { color: palette.muted, formatter: v => fmtMoney(v) }, splitLine: { lineStyle: { color: palette.line } } },
       ],
       series: [
-        { name: "最新价", type: "line", showSymbol: false, data: categories.map(time => priceByTime.get(time)?.close ?? null), lineStyle: { color: "#e95f55", width: 2 }, connectNulls: true, markLine: preClose ? { silent: true, symbol: "none", lineStyle: { color: "#667c76", type: "dashed" }, label: { formatter: `昨收 ${preClose.toFixed(2)}`, color: "#8ca59e" }, data: [{ yAxis: preClose }] } : undefined },
-        { name: "当日均价", type: "line", showSymbol: false, data: categories.map(time => Number(priceByTime.get(time)?.average || 0) || null), lineStyle: { color: "#efb85b", width: 1.2 }, connectNulls: true },
-        { name: "分钟成交量", type: "bar", xAxisIndex: 1, yAxisIndex: 1, barMaxWidth: 5, data: categories.map(time => { const row = priceByTime.get(time); if (!row) return null; const up = Number(row.close || 0) >= Number(row.open || row.close || 0); return { value: Number(row.volume || 0), itemStyle: { color: up ? "rgba(233,95,85,.58)" : "rgba(39,180,143,.58)" } }; }) },
-        { name: "累计主力净流", type: "line", xAxisIndex: 2, yAxisIndex: 2, showSymbol: false, data: categories.map(time => flowByTime.get(time)?.flow ?? null), lineStyle: { color: "#8aa9ff", width: 1.6 }, connectNulls: true },
-        { name: "资金分钟变化", type: "bar", xAxisIndex: 2, yAxisIndex: 2, barMaxWidth: 4, data: flowDelta.map(value => value == null ? null : ({ value, itemStyle: { color: value >= 0 ? "rgba(233,95,85,.42)" : "rgba(39,180,143,.42)" } })) },
+        { name: "最新价", type: "line", showSymbol: false, data: categories.map(time => priceByTime.get(time)?.close ?? null), lineStyle: { color: palette.up, width: 2 }, connectNulls: true, markLine: preClose ? { silent: true, symbol: "none", lineStyle: { color: palette.line, type: "dashed" }, label: { formatter: `昨收 ${preClose.toFixed(2)}`, color: palette.muted }, data: [{ yAxis: preClose }] } : undefined },
+        { name: "当日均价", type: "line", showSymbol: false, data: categories.map(time => Number(priceByTime.get(time)?.average || 0) || null), lineStyle: { color: palette.amber, width: 1.2 }, connectNulls: true },
+        { name: "分钟成交量", type: "bar", xAxisIndex: 1, yAxisIndex: 1, barMaxWidth: 5, data: categories.map(time => { const row = priceByTime.get(time); if (!row) return null; const up = Number(row.close || 0) >= Number(row.open || row.close || 0); return { value: Number(row.volume || 0), itemStyle: { color: up ? palette.up : palette.down, opacity: .58 } }; }) },
+        { name: "累计主力净流", type: "line", xAxisIndex: 2, yAxisIndex: 2, showSymbol: false, data: categories.map(time => flowByTime.get(time)?.flow ?? null), lineStyle: { color: palette.mint, width: 1.6 }, connectNulls: true },
+        { name: "资金分钟变化", type: "bar", xAxisIndex: 2, yAxisIndex: 2, barMaxWidth: 4, data: flowDelta.map(value => value == null ? null : ({ value, itemStyle: { color: value >= 0 ? palette.up : palette.down, opacity: .42 } })) },
       ],
-      }, { notMerge: false, replaceMerge: ["grid", "xAxis", "yAxis", "series"], lazyUpdate: true, silent: true });
-      const hoverIndex = categories.indexOf(STATE.stockHoverTime);
-      if (STATE.stockHoverActive && hoverIndex >= 0) {
-        const seriesIndex = priceByTime.has(STATE.stockHoverTime) ? 0 : 3;
-        requestAnimationFrame(() => stockTimelineChart.dispatchAction({ type: "showTip", seriesIndex, dataIndex: hoverIndex }));
-      }
+      }, { notMerge: false, replaceMerge: ["grid", "xAxis", "yAxis", "series"], lazyUpdate: false, silent: true });
     }
     const disclosure = payload.source_disclosure || {};
     const priceSource = payload.price_source || {};
@@ -598,7 +757,7 @@
     $("bookQuoteStats").innerHTML = `<span>开 ${book.open ? Number(book.open).toFixed(2) : "--"}</span><span>高 ${book.high ? Number(book.high).toFixed(2) : "--"}</span><span>低 ${book.low ? Number(book.low).toFixed(2) : "--"}</span><span>昨 ${preClose ? preClose.toFixed(2) : "--"}</span>`;
     const levels = [...(book.asks || []), ...(book.bids || [])];
     const maxVolume = Math.max(1, ...levels.map(row => Number(row.volume_lots || 0)));
-    const rowHtml = side => row => `<div class="book-row ${side}" style="--depth:${Math.min(100, Number(row.volume_lots || 0) / maxVolume * 100).toFixed(1)}%;--depth-color:${side === "ask" ? "#27b48f" : "#e95f55"}"><span class="side">${side === "ask" ? "卖" : "买"}${row.level}</span><span class="price">${row.price ? Number(row.price).toFixed(2) : "--"}</span><span class="volume">${row.volume_lots ? Number(row.volume_lots).toFixed(0) : "--"}手</span></div>`;
+    const rowHtml = side => row => `<div class="book-row ${side}" style="--depth:${Math.min(100, Number(row.volume_lots || 0) / maxVolume * 100).toFixed(1)}%;--depth-color:var(${side === "ask" ? "--down" : "--up"})"><span class="side">${side === "ask" ? "卖" : "买"}${row.level}</span><span class="price">${row.price ? Number(row.price).toFixed(2) : "--"}</span><span class="volume">${row.volume_lots ? Number(row.volume_lots).toFixed(0) : "--"}手</span></div>`;
     $("orderBookRows").innerHTML = book.ok ? `${(book.asks || []).map(rowHtml("ask")).join("")}<div class="book-mid"><span>最新</span><b class="${cls(last - preClose)}">${last ? last.toFixed(2) : "--"} ${preClose ? fmtPct((last / preClose - 1) * 100) : ""}</b></div>${(book.bids || []).map(rowHtml("bid")).join("")}` : `<div class="empty">${esc(book.error || "盘口暂无可用快照")}</div>`;
     const source = book.source || {};
     $("orderBookSource").textContent = book.ok ? `来源：${source.provider || "--"}；接口：${source.endpoint || "--"}；主机：${source.host || "--"}。${source.limitation || "盘口仅为当前快照。"}` : `${book.error || "盘口不可用"}；历史盘口不能由分钟行情事后回补。`;
@@ -614,6 +773,7 @@
     });
   }
   function renderLiquidity(payload) {
+    const palette = chartTheme();
     const allStocks = payload.stocks || [];
     const stocks = allStocks.slice(0, STATE.liquidityLimit);
     const liquidityTime = stocks.map(row => row.data_time || "").sort().at(-1) || "--";
@@ -627,14 +787,14 @@
     const groupCounts = new Map();
     if (STATE.liquidityColorMode !== "performance") stocks.forEach(row => groupCounts.set(row[groupField] || "未分类", (groupCounts.get(row[groupField] || "未分类") || 0) + 1));
     $("liquidityLegend").innerHTML = STATE.liquidityColorMode === "performance" ? "" : [...groupCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 18).map(([name, count]) => `<span class="legend-chip"><i style="background:${stableColor(name)}"></i>${esc(name)} ${count}</span>`).join("");
-    const pointColor = row => STATE.liquidityColorMode === "performance" ? (row.change_pct >= 0 ? "rgba(225,82,74,.75)" : "rgba(35,182,141,.75)") : stableColor(row[groupField] || "未分类");
+    const pointColor = row => STATE.liquidityColorMode === "performance" ? (row.change_pct >= 0 ? palette.up : palette.down) : stableColor(row[groupField] || "未分类");
     scatterChart.setOption({
       animation: false,
-      tooltip: { formatter: p => { const r = p?.data?.raw; if (!r) return esc(p?.name || ""); return `<b>${r.name}</b> ${r.code}.${r.market}<br>行业 ${esc(r.industry || "未分类")} · 主概念 ${esc(r.primary_concept || "未分类")}<br>涨跌 ${fmtPct(r.change_pct)} · 量比 ${r.volume_ratio.toFixed(2)}<br>成交额 ${fmtMoney(r.amount)} · 主力净流 ${fmtMoney(r.main_net_inflow)}<br>概念 ${esc(r.concepts || "--")}`; }, backgroundColor: "#07110f", borderColor: "#295249" },
+      tooltip: { formatter: p => { const r = p?.data?.raw; if (!r) return esc(p?.name || ""); return `<b>${r.name}</b> ${r.code}.${r.market}<br>行业 ${esc(r.industry || "未分类")} · 主概念 ${esc(r.primary_concept || "未分类")}<br>涨跌 ${fmtPct(r.change_pct)} · 量比 ${r.volume_ratio.toFixed(2)}<br>成交额 ${fmtMoney(r.amount)} · 主力净流 ${fmtMoney(r.main_net_inflow)}<br>概念 ${esc(r.concepts || "--")}`; }, backgroundColor: palette.panel, borderColor: palette.line, textStyle: { color: palette.text } },
       grid: { left: 55, right: 24, top: 24, bottom: 44 },
-      xAxis: { type: "value", name: "涨跌幅 %", nameTextStyle: { color: "#6f8c84" }, axisLabel: { color: "#6f8c84", formatter: "{value}%" }, splitLine: { lineStyle: { color: "rgba(45,75,69,.3)" } } },
-      yAxis: { type: "value", name: "量比", nameTextStyle: { color: "#6f8c84" }, axisLabel: { color: "#6f8c84" }, splitLine: { lineStyle: { color: "rgba(45,75,69,.3)" } } },
-      series: [{ type: "scatter", data: stocks.map(row => ({ value: [row.change_pct, Math.min(12, row.volume_ratio), row.amount], raw: row, symbolSize: Math.max(7, Math.min(34, 7 + 27 * Math.sqrt(row.amount / p90))), itemStyle: { color: pointColor(row), borderColor: pointColor(row), borderWidth: 0 } })), markLine: { silent: true, lineStyle: { color: "#516b65", type: "dashed" }, data: [{ xAxis: 0 }, { yAxis: 1 }] } }],
+      xAxis: { type: "value", name: "涨跌幅 %", nameTextStyle: { color: palette.muted }, axisLabel: { color: palette.muted, formatter: "{value}%" }, splitLine: { lineStyle: { color: palette.line } } },
+      yAxis: { type: "value", name: "量比", nameTextStyle: { color: palette.muted }, axisLabel: { color: palette.muted }, splitLine: { lineStyle: { color: palette.line } } },
+      series: [{ type: "scatter", data: stocks.map(row => ({ value: [row.change_pct, Math.min(12, row.volume_ratio), row.amount], raw: row, symbolSize: Math.max(7, Math.min(34, 7 + 27 * Math.sqrt(row.amount / p90))), itemStyle: { color: pointColor(row), borderColor: pointColor(row), opacity: .78, borderWidth: 0 } })), markLine: { silent: true, lineStyle: { color: palette.line, type: "dashed" }, data: [{ xAxis: 0 }, { yAxis: 1 }] } }],
     }, { notMerge: true, lazyUpdate: true, silent: true });
     renderQueue("surgingQueue", payload.queues?.surging);
     renderQueue("activeQueue", payload.queues?.active);
@@ -689,7 +849,7 @@
   }
   function applyLivePayload(payload) {
     renderMeta(payload.snapshot);
-    if (STATE.interacting) {
+    if (STATE.interacting || Date.now() < STATE.themeChartRefreshNotBefore) {
       STATE.deferredPayload = payload;
       return;
     }
@@ -1017,6 +1177,7 @@
         liquidityColorMode: STATE.liquidityColorMode,
         liquidityLimit: STATE.liquidityLimit,
         theme: STATE.theme,
+        customTheme: STATE.customThemeSaved,
         showAuction: STATE.showAuction,
       }));
     } catch (_error) { /* localStorage can be disabled; the page remains usable. */ }
@@ -1032,6 +1193,8 @@
       if ([0, 1, 2].includes(saved.stockDetail)) STATE.stockDetail = saved.stockDetail;
       if (["performance", "industry", "concept"].includes(saved.liquidityColorMode)) STATE.liquidityColorMode = saved.liquidityColorMode;
       if (LIQUIDITY_CHOICES.includes(saved.liquidityLimit)) STATE.liquidityLimit = saved.liquidityLimit;
+      STATE.customThemeSaved = sanitizeCustomTheme(saved.customTheme);
+      STATE.customTheme = { ...STATE.customThemeSaved };
       const savedTheme = THEME_ALIASES[saved.theme] || saved.theme;
       if (THEMES.includes(savedTheme)) STATE.theme = savedTheme;
       if (typeof saved.showAuction === "boolean") STATE.showAuction = saved.showAuction;
@@ -1053,12 +1216,10 @@
     $("stockDetailLabel").textContent = DETAIL_LABELS[STATE.stockDetail];
     if ($("liquidityCount")) $("liquidityCount").value = String(Math.max(0, LIQUIDITY_CHOICES.indexOf(STATE.liquidityLimit)));
     if ($("liquidityCountLabel")) $("liquidityCountLabel").textContent = `TOP${STATE.liquidityLimit}`;
+    if (STATE.theme === "custom") STATE.customTheme = applyCustomThemeVars(STATE.customThemeSaved);
+    else clearCustomThemeVars();
     document.documentElement.dataset.theme = STATE.theme;
-    document.querySelectorAll("[data-theme-choice]").forEach(button => {
-      const active = button.dataset.themeChoice === STATE.theme;
-      button.classList.toggle("active", active);
-      button.setAttribute("aria-pressed", String(active));
-    });
+    syncThemeButtons();
     document.querySelectorAll("[data-liquidity-color]").forEach(button => button.classList.toggle("active", button.dataset.liquidityColor === STATE.liquidityColorMode));
   }
   const chartsForModule = module => [sectorChart, stockChart, timelineChart, scatterChart, stockTimelineChart].filter(chart => module.contains(chart.getDom()));
@@ -1193,23 +1354,234 @@
     requestAnimationFrame(() => [sectorChart, stockChart, timelineChart, scatterChart, stockTimelineChart].forEach(chart => chart.resize()));
     banner("已恢复默认模块尺寸并自动紧凑重排；刷新后不会保存空洞。", "");
   }
-  function applyTheme(theme) {
-    const normalizedTheme = THEME_ALIASES[theme] || theme;
-    STATE.theme = THEMES.includes(normalizedTheme) ? normalizedTheme : "cloud";
-    document.documentElement.dataset.theme = STATE.theme;
+  function syncThemeButtons() {
     document.querySelectorAll("[data-theme-choice]").forEach(button => {
       const active = button.dataset.themeChoice === STATE.theme;
       button.classList.toggle("active", active);
       button.setAttribute("aria-pressed", String(active));
     });
-    savePreferences();
-    requestAnimationFrame(() => {
-      [sectorChart, stockChart, timelineChart, scatterChart, stockTimelineChart].forEach(chart => chart.resize());
-      if (STATE.sectors.length) renderSectorSurfaces();
-      if (STATE.racePayload) renderRace(STATE.racePayload);
-      if (STATE.selectedSectorDetail) renderStocks(STATE.selectedSectorDetail);
-      if (STATE.liquidity) renderLiquidity(STATE.liquidity);
+    const customButton = $("customThemeButton");
+    if (customButton) {
+      customButton.style.setProperty("--theme-accent", STATE.customThemeSaved.hex);
+      customButton.title = `${STATE.customThemeSaved.name} · ${STATE.customThemeSaved.hex.toUpperCase()}`;
+    }
+  }
+  function refreshThemeCharts() {
+    STATE.stockHoverActive = false;
+    STATE.stockHoverTime = "";
+    [sectorChart, stockChart, timelineChart, scatterChart, stockTimelineChart].forEach(chart => {
+      chart.getZr().trigger("globalout", { event: {} });
+      chart.dispatchAction({ type: "hideTip" });
+    });
+    STATE.lastRaceSignature = "";
+    clearTimeout(STATE.stockThemeRefreshTimer);
+    STATE.stockThemeRefreshNotBefore = Date.now() + 1800;
+    STATE.stockThemeRefreshTimer = setTimeout(() => {
+      STATE.stockThemeRefreshTimer = 0;
+      STATE.stockThemeRefreshNotBefore = 0;
+      STATE.lastStockTimelineSignature = "";
+      stockTimelineChart.getZr().trigger("globalout", { event: {} });
+      stockTimelineChart.dispatchAction({ type: "hideTip" });
+      stockTimelineChart.resize();
       if (STATE.currentStockPayload) renderStockTimeline(STATE.currentStockPayload);
+    }, 1800);
+    clearTimeout(STATE.themeChartRefreshTimer);
+    STATE.themeChartRefreshNotBefore = Date.now() + 500;
+    STATE.themeChartRefreshTimer = setTimeout(() => {
+      STATE.themeChartRefreshTimer = 0;
+      STATE.themeChartRefreshNotBefore = 0;
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        [sectorChart, stockChart, timelineChart, scatterChart].forEach(chart => chart.resize());
+        if (STATE.sectors.length) renderSectorSurfaces();
+        if (STATE.racePayload) renderRace(STATE.racePayload);
+        if (STATE.selectedSectorDetail) renderStocks(STATE.selectedSectorDetail);
+        if (STATE.liquidity) renderLiquidity(STATE.liquidity);
+        flushDeferredPayload();
+      }));
+    }, 500);
+  }
+  function hideCustomThemePanel() {
+    const panel = $("customThemePanel");
+    if (panel) panel.hidden = true;
+    $("customThemeButton")?.setAttribute("aria-expanded", "false");
+  }
+  function applyTheme(theme, options = {}) {
+    const normalizedTheme = THEME_ALIASES[theme] || theme;
+    STATE.theme = THEMES.includes(normalizedTheme) ? normalizedTheme : "cloud";
+    if (STATE.theme === "custom") STATE.customTheme = applyCustomThemeVars(STATE.customTheme);
+    else {
+      clearCustomThemeVars();
+      if (!options.keepEditorOpen) hideCustomThemePanel();
+    }
+    document.documentElement.dataset.theme = STATE.theme;
+    syncThemeButtons();
+    if (options.persist !== false) savePreferences();
+    if (options.refreshCharts !== false) refreshThemeCharts();
+  }
+  function updateCustomThemeControls() {
+    const theme = sanitizeCustomTheme(STATE.customTheme);
+    STATE.customTheme = theme;
+    const field = $("customColorField");
+    const cursor = $("customColorCursor");
+    field?.style.setProperty("--picker-hue", String(theme.hue));
+    if (cursor) {
+      cursor.style.left = `${theme.saturation}%`;
+      cursor.style.top = `${100 - theme.value}%`;
+    }
+    if (field) {
+      field.setAttribute("aria-valuenow", String(Math.round(theme.value)));
+      field.setAttribute("aria-valuetext", `饱和度${Math.round(theme.saturation)}%，明度${Math.round(theme.value)}%`);
+    }
+    if ($("customHue")) $("customHue").value = String(Math.round(theme.hue));
+    if ($("customHex")) {
+      $("customHex").value = theme.hex.toUpperCase();
+      $("customHex").setAttribute("aria-invalid", "false");
+    }
+    if ($("customThemeSave")) $("customThemeSave").disabled = false;
+    if ($("customThemeName")) $("customThemeName").value = theme.name;
+    document.querySelectorAll("[data-custom-mode]").forEach(button => {
+      const active = button.dataset.customMode === theme.mode;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-pressed", String(active));
+    });
+    const { companion, tokens } = customThemeTokens(theme);
+    $("customPreviewAccent")?.style.setProperty("background", theme.hex);
+    $("customPreviewSurface")?.style.setProperty("background", tokens["--panel"]);
+    $("customPreviewCompanion")?.style.setProperty("background", companion);
+    if ($("customPreviewLabel")) $("customPreviewLabel").textContent = `${theme.name} · ${theme.hex.toUpperCase()} · ${theme.mode === "dark" ? "深色" : "浅色"}`;
+  }
+  function previewCustomTheme(refreshCharts = false) {
+    if (STATE.customThemeFrame) cancelAnimationFrame(STATE.customThemeFrame);
+    STATE.customThemeFrame = requestAnimationFrame(() => {
+      STATE.customThemeFrame = 0;
+      STATE.customTheme = applyCustomThemeVars(STATE.customTheme);
+      STATE.theme = "custom";
+      document.documentElement.dataset.theme = "custom";
+      syncThemeButtons();
+      updateCustomThemeControls();
+      if (refreshCharts) refreshThemeCharts();
+    });
+  }
+  function openCustomThemeEditor() {
+    const panel = $("customThemePanel");
+    if (!panel) return;
+    if (!panel.hidden) {
+      cancelCustomThemeEditor();
+      return;
+    }
+    STATE.customThemePrevious = STATE.theme;
+    STATE.customTheme = { ...STATE.customThemeSaved };
+    panel.hidden = false;
+    $("customThemeButton")?.setAttribute("aria-expanded", "true");
+    applyTheme("custom", { persist: false, keepEditorOpen: true });
+    updateCustomThemeControls();
+    requestAnimationFrame(() => $("customColorField")?.focus());
+  }
+  function cancelCustomThemeEditor() {
+    STATE.customTheme = { ...STATE.customThemeSaved };
+    const previous = STATE.customThemePrevious === "custom" ? "custom" : STATE.customThemePrevious;
+    hideCustomThemePanel();
+    applyTheme(previous, { persist: false });
+  }
+  function saveCustomTheme() {
+    const hexInput = $("customHex");
+    if (!normalizeHex(hexInput?.value)) {
+      hexInput?.setAttribute("aria-invalid", "true");
+      hexInput?.focus();
+      banner("自定义颜色格式无效，未保存；请使用 #RRGGBB。", "warn");
+      return;
+    }
+    STATE.customThemeSaved = sanitizeCustomTheme(STATE.customTheme);
+    STATE.customTheme = { ...STATE.customThemeSaved };
+    hideCustomThemePanel();
+    applyTheme("custom");
+    banner(`已保存自定义主题“${STATE.customThemeSaved.name}”；刷新页面后仍会保留。`, "");
+  }
+  function resetCustomThemeDraft() {
+    STATE.customTheme = { ...DEFAULT_CUSTOM_THEME };
+    previewCustomTheme(true);
+  }
+  function updateCustomThemeFromField(event) {
+    const field = $("customColorField");
+    if (!field) return;
+    const bounds = field.getBoundingClientRect();
+    const saturation = clamp((event.clientX - bounds.left) / Math.max(1, bounds.width) * 100, 0, 100);
+    const value = clamp(100 - (event.clientY - bounds.top) / Math.max(1, bounds.height) * 100, 0, 100);
+    STATE.customTheme = { ...STATE.customTheme, saturation, value, hex: hsvToHex(STATE.customTheme.hue, saturation, value) };
+    previewCustomTheme(false);
+  }
+  function bindCustomThemeEditor() {
+    const field = $("customColorField");
+    if (!field) return;
+    field.addEventListener("pointerdown", event => {
+      STATE.customThemeDragging = true;
+      setInteracting(true);
+      field.setPointerCapture?.(event.pointerId);
+      updateCustomThemeFromField(event);
+    });
+    field.addEventListener("pointermove", event => { if (STATE.customThemeDragging) updateCustomThemeFromField(event); });
+    const finishDrag = event => {
+      if (!STATE.customThemeDragging) return;
+      STATE.customThemeDragging = false;
+      field.releasePointerCapture?.(event.pointerId);
+      setInteracting(false);
+      previewCustomTheme(true);
+    };
+    field.addEventListener("pointerup", finishDrag);
+    field.addEventListener("pointercancel", finishDrag);
+    field.addEventListener("keydown", event => {
+      const step = event.shiftKey ? 5 : 1;
+      if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+      event.preventDefault();
+      const saturation = clamp(STATE.customTheme.saturation + (event.key === "ArrowLeft" ? -step : event.key === "ArrowRight" ? step : 0), 0, 100);
+      const value = clamp(STATE.customTheme.value + (event.key === "ArrowDown" ? -step : event.key === "ArrowUp" ? step : 0), 0, 100);
+      STATE.customTheme = { ...STATE.customTheme, saturation, value, hex: hsvToHex(STATE.customTheme.hue, saturation, value) };
+      previewCustomTheme(true);
+    });
+    const hueInput = $("customHue");
+    hueInput?.addEventListener("pointerdown", () => setInteracting(true));
+    hueInput?.addEventListener("pointerup", () => setInteracting(false));
+    hueInput?.addEventListener("pointercancel", () => setInteracting(false));
+    hueInput?.addEventListener("input", event => {
+      const hue = clamp(event.target.value, 0, 359);
+      STATE.customTheme = { ...STATE.customTheme, hue, hex: hsvToHex(hue, STATE.customTheme.saturation, STATE.customTheme.value) };
+      previewCustomTheme(false);
+    });
+    hueInput?.addEventListener("change", () => previewCustomTheme(true));
+    const commitHex = () => {
+      const input = $("customHex");
+      const hex = normalizeHex(input?.value);
+      if (!hex) {
+        input?.setAttribute("aria-invalid", "true");
+        banner("自定义颜色需要使用 #RRGGBB 格式。", "warn");
+        return;
+      }
+      const hsv = hexToHsv(hex);
+      STATE.customTheme = { ...STATE.customTheme, ...hsv, hex };
+      previewCustomTheme(true);
+    };
+    $("customHex")?.addEventListener("input", event => {
+      const valid = Boolean(normalizeHex(event.target.value));
+      event.target.setAttribute("aria-invalid", String(!valid));
+      if ($("customThemeSave")) $("customThemeSave").disabled = !valid;
+    });
+    $("customHex")?.addEventListener("change", commitHex);
+    $("customHex")?.addEventListener("keydown", event => { if (event.key === "Enter") { event.preventDefault(); commitHex(); } });
+    $("customThemeName")?.addEventListener("input", event => {
+      STATE.customTheme = { ...STATE.customTheme, name: String(event.target.value || "").slice(0, 12) || DEFAULT_CUSTOM_THEME.name };
+      updateCustomThemeControls();
+    });
+    document.querySelectorAll("[data-custom-mode]").forEach(button => button.addEventListener("click", () => {
+      STATE.customTheme = { ...STATE.customTheme, mode: button.dataset.customMode };
+      previewCustomTheme(true);
+    }));
+    $("customThemeSave")?.addEventListener("click", saveCustomTheme);
+    $("customThemeReset")?.addEventListener("click", resetCustomThemeDraft);
+    $("customThemeCancel")?.addEventListener("click", cancelCustomThemeEditor);
+    $("customThemeClose")?.addEventListener("click", cancelCustomThemeEditor);
+    $("customThemePanel")?.addEventListener("keydown", event => {
+      if (event.key === "Escape") { event.preventDefault(); cancelCustomThemeEditor(); }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") { event.preventDefault(); saveCustomTheme(); }
     });
   }
   function bindDialog(openId, dialogId, closeId) {
@@ -1339,7 +1711,9 @@
   }
   loadPreferences();
   initResizableModules();
-  document.querySelectorAll("[data-theme-choice]").forEach(button => button.addEventListener("click", () => applyTheme(button.dataset.themeChoice)));
+  document.querySelectorAll('[data-theme-choice]:not([data-theme-choice="custom"])').forEach(button => button.addEventListener("click", () => applyTheme(button.dataset.themeChoice)));
+  $("customThemeButton")?.addEventListener("click", openCustomThemeEditor);
+  bindCustomThemeEditor();
   bindDialog("settingsButton", "settingsDialog", "settingsClose");
   bindStockTerminalDialog();
   bindEntityDoubleClicks();
