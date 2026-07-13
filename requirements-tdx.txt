@@ -1,0 +1,2 @@
+-r requirements.txt
+pytdx>=1.72

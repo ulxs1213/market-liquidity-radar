@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>市场流动性雷达</title>
+  <link rel="stylesheet" href="/static/market_heatmap.css?v=20260713.11">
+  <script src="/static/echarts.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">iStock · MARKET LIQUIDITY</div>
+      <h1>市场流动性雷达</h1>
+      <p>净流入/净流出板块赛马、头部热力与历史交易日回看的 3 秒动态观察页</p>
+    </div>
+    <div class="source-strip" aria-live="polite">
+      <span id="modeBadge" class="badge muted">连接中</span>
+      <span><b>数据时间</b><em id="dataTime">--</em></span>
+      <span><b>抓取时间</b><em id="fetchedAt">--</em></span>
+      <span><b>来源</b><em id="sourceName">--</em></span>
+      <span><b>延迟</b><em id="sourceLatency">--</em></span>
+    </div>
+  </header>
+
+  <main>
+    <section class="toolbar panel">
+      <div class="segmented" aria-label="板块类型">
+        <button data-board="industry" class="active">行业板块</button>
+        <button data-board="concept">概念板块</button>
+      </div>
+      <label>面积
+        <select id="sizeMetric">
+          <option value="abs_flow" selected>主力净流绝对值</option>
+          <option value="amount">成交额</option>
+        </select>
+      </label>
+      <label>颜色
+        <select id="colorMetric">
+          <option value="change_pct">涨跌幅</option>
+          <option value="main_net_ratio">主力净流占比</option>
+          <option value="delta_flow">3秒净流增量</option>
+          <option value="strength_score">透明强弱分</option>
+        </select>
+      </label>
+      <label class="search">筛选
+        <input id="sectorSearch" placeholder="输入板块名称/代码">
+      </label>
+      <button id="pauseButton" class="ghost">冻结排序</button>
+      <button id="refreshButton" class="ghost">立即刷新</button>
+      <button id="resetLayoutButton" class="ghost" type="button">恢复默认布局</button>
+      <div class="theme-picker" role="group" aria-label="界面主题">
+        <span>界面</span>
+        <button type="button" data-theme-choice="cloud" class="active" aria-label="云白主题" title="云白"></button>
+        <button type="button" data-theme-choice="midnight" aria-label="深夜主题" title="深夜"></button>
+        <button type="button" data-theme-choice="ocean" aria-label="海洋蓝主题" title="海洋蓝"></button>
+        <button type="button" data-theme-choice="sand" aria-label="暖沙主题" title="暖沙"></button>
+        <button type="button" data-theme-choice="slate" aria-label="岩灰主题" title="岩灰"></button>
+        <button type="button" data-theme-choice="violet" aria-label="星云紫主题" title="星云紫"></button>
+      </div>
+      <button id="settingsButton" class="ghost settings-button" type="button" aria-haspopup="dialog" aria-controls="settingsDialog">设置 / 数据口径</button>
+    </section>
+
+    <section id="statusBanner" class="status-banner">正在建立数据连接…</section>
+
+    <section class="summary-grid">
+      <article class="summary-card"><span>净流入板块</span><strong id="inflowCount">--</strong><small id="inflowAmount">--</small></article>
+      <article class="summary-card"><span>净流出板块</span><strong id="outflowCount">--</strong><small id="outflowAmount">--</small></article>
+      <article class="summary-card"><span>上涨 / 下跌</span><strong id="breadthCount">--</strong><small id="breadthText">--</small></article>
+      <article class="summary-card"><span>当前焦点</span><strong id="selectedSector">全市场</strong><small id="selectedSectorMeta">点击热力格下钻</small></article>
+    </section>
+
+    <section class="main-grid">
+      <article class="panel heatmap-panel user-resizable" data-module-id="sector-heatmap">
+        <div class="panel-title panel-title-controls">
+          <div><span>01</span><h2>头部板块热力图</h2></div>
+          <div class="density-controls">
+            <label>信息 <input id="heatmapDetail" type="range" min="0" max="2" step="1" value="1"><b id="heatmapDetailLabel">标准</b></label>
+            <label>每侧 <input id="heatmapCount" type="range" min="0" max="3" step="1" value="0"><b id="heatmapCountLabel">TOP10</b></label>
+          </div>
+          <small id="heatmapHint">净流入TOP10 + 净流出TOP10</small>
+        </div>
+        <div id="sectorTreemap" class="chart chart-large" role="img" aria-label="板块热力图"></div>
+      </article>
+      <aside class="flow-rankings">
+        <article class="panel ranking user-resizable" data-module-id="inflow-ranking">
+          <div class="panel-title"><div><span>02A</span><h2>净流入</h2></div><small>本地分钟f62迷你分时</small></div>
+          <div id="inflowList" class="rank-list"></div>
+        </article>
+        <article class="panel ranking user-resizable" data-module-id="outflow-ranking">
+          <div class="panel-title"><div><span>02B</span><h2>净流出</h2></div><small>本地分钟f62迷你分时</small></div>
+          <div id="outflowList" class="rank-list"></div>
+        </article>
+      </aside>
+    </section>
+
+    <section class="detail-grid race-detail-grid">
+      <article class="panel race-panel user-resizable" data-module-id="sector-race">
+        <div class="panel-title race-title">
+          <div><span>03</span><h2 id="raceTitle">多板块资金赛马 · 净流入TOP5 vs 净流出TOP5</h2></div>
+          <div class="history-controls" aria-label="板块资金赛马历史日期控制">
+            <div id="raceScaleMode" class="segmented micro-segmented race-scale-toggle" role="group" aria-label="赛马图纵轴尺度">
+              <button type="button" data-race-scale="independent" class="active" aria-pressed="true">独立尺度</button>
+              <button type="button" data-race-scale="shared" aria-pressed="false">共同尺度</button>
+            </div>
+            <label class="race-count-control">每侧 <input id="raceCount" type="range" min="0" max="3" step="1" value="0"><b id="raceCountLabel">TOP5</b></label>
+            <button id="raceOlder" class="mini-button" type="button">← 前一日</button>
+            <input id="raceTradeDate" type="date" aria-label="板块赛马交易日">
+            <button id="raceNewer" class="mini-button" type="button">后一日 →</button>
+            <button id="raceLatest" class="mini-button active" type="button">最近</button>
+          </div>
+        </div>
+        <div class="race-stage">
+          <div id="flowTimeline" class="chart chart-race" role="img" aria-label="多个强弱板块资金流入流出分时赛马图"></div>
+          <aside class="race-label-column" aria-label="赛马板块点选区">
+            <div class="race-label-heading"><b>流入 / 流出分组</b><small>独立尺度分区 · 点击联动核心个股</small></div>
+            <div id="raceClickRail" class="race-click-rail" aria-label="可点击的赛马板块名称"></div>
+          </aside>
+        </div>
+        <div class="chart-source-note" id="raceSourceNote">
+          <b>数据源读取中 · 默认独立双尺度</b><span>净流入上区与净流出下区分别缩放以保证可读性，跨区高度不可比较；悬浮金额仍为真实有符号人民币元。</span>
+        </div>
+      </article>
+      <article class="panel stock-drill-panel user-resizable" data-module-id="core-stocks">
+        <div class="panel-title panel-title-controls">
+          <div><span>04</span><h2>选中板块核心个股</h2></div>
+          <div class="density-controls compact-controls">
+            <label>信息 <input id="stockDetail" type="range" min="0" max="2" step="1" value="1"><b id="stockDetailLabel">标准</b></label>
+            <label>数量 <input id="stockCount" type="range" min="0" max="3" step="1" value="1"><b id="stockCountLabel">TOP20</b></label>
+          </div>
+          <small id="stockSource">点击热力格或赛马线下钻</small>
+        </div>
+        <div id="stockTreemap" class="chart chart-race" role="img" aria-label="核心个股热力图"></div>
+      </article>
+    </section>
+
+    <section class="panel liquidity-panel user-resizable" data-module-id="liquidity-core">
+      <div class="panel-title panel-title-controls">
+        <div><span>05</span><h2>全市场流动性核心标的</h2></div>
+        <div class="segmented micro-segmented" id="liquidityColorMode" aria-label="核心标的着色维度">
+          <button data-liquidity-color="performance" class="active">涨跌</button>
+          <button data-liquidity-color="industry">行业</button>
+          <button data-liquidity-color="concept">概念板块</button>
+        </div>
+        <div class="density-controls liquidity-count-control">
+          <label>标的 <input id="liquidityCount" type="range" min="0" max="4" step="1" value="1"><b id="liquidityCountLabel">TOP50</b></label>
+        </div>
+        <small id="liquiditySource">横轴=涨跌幅 · 纵轴=量比 · 气泡=成交额</small>
+      </div>
+      <div class="exclusion-note" id="liquidityExclusion">新股与上市初期极端涨幅样本将从核心流动性面板剔除。</div>
+      <div id="liquidityLegend" class="classification-legend" aria-label="行业或概念着色图例"></div>
+      <div id="liquidityScatter" class="chart chart-wide" role="img" aria-label="全市场流动性散点图"></div>
+      <div class="intraday-title">
+        <div><span>05B</span><h3 id="selectedStockTitle">点击气泡或队列标的，查看当天连续分时</h3></div>
+        <div class="intraday-actions">
+          <small id="stockTimelineSource">分钟资金流 + 本地分钟留档</small>
+          <label class="auction-control" title="集合竞价数据可用后方可开启">
+            <input id="auctionToggle" type="checkbox" disabled>
+            <span>集合竞价</span>
+            <small id="auctionStatus">数据检测中</small>
+          </label>
+          <button id="stockTerminalOpen" class="mini-button" type="button" aria-haspopup="dialog" aria-controls="stockTerminalDialog">弹窗查看成交终端</button>
+        </div>
+      </div>
+      <div id="stockTerminalHome" class="stock-terminal-home">
+        <div id="stockTerminal" class="stock-terminal">
+          <div class="stock-chart-pane">
+            <div id="stockTimeline" class="chart stock-terminal-chart" role="img" aria-label="核心个股价格均价成交量和资金流连续分时"></div>
+            <div class="chart-source-note stock-source-note" id="stockDetailSource"><b>请选择标的</b><span>左侧将显示价格、均价、成交量、资金流；右侧显示实时五档盘口。</span></div>
+          </div>
+          <aside class="order-book" aria-label="实时五档盘口">
+            <div class="order-book-head"><div><b id="bookStockName">--</b><small id="bookStockCode">--</small></div><strong id="bookLastPrice">--</strong></div>
+            <div class="quote-stats" id="bookQuoteStats"><span>开 --</span><span>高 --</span><span>低 --</span><span>昨 --</span></div>
+            <div id="orderBookRows" class="order-book-rows"><div class="empty">点击标的读取盘口</div></div>
+            <div class="order-book-source" id="orderBookSource">盘口仅代表当前快照；历史盘口不可事后回补。</div>
+          </aside>
+        </div>
+      </div>
+      <div class="watch-queues">
+        <article><h3>放量上涨</h3><div id="surgingQueue" class="queue"></div></article>
+        <article><h3>大额活跃</h3><div id="activeQueue" class="queue"></div></article>
+        <article><h3>放量下跌</h3><div id="fallingQueue" class="queue"></div></article>
+      </div>
+    </section>
+
+    <section class="method panel user-resizable" data-module-id="method-notes">
+      <h2>口径与边界</h2>
+      <p><b>资金流：</b>东方财富 f62 供应商估算主力净流入，不是交易所逐账户现金流；3 秒增量是同一交易日相邻成功快照累计值之差，日切归零。</p>
+      <p><b>强弱分：</b>2.5%/97.5%缩尾后，0.35×涨幅Z + 0.35×净流入占比Z + 0.20×上涨/下跌家数广度Z + 0.10×净流入增量Z；每个分项可在接口中审计。</p>
+      <p><b>放量队列：</b>成交额至少 5000 万元、量比至少 1、绝对涨跌至少 2%；大额活跃要求成交额至少 5000 万元且满足量比或涨跌异常。</p>
+      <p><b>用途：</b>仅用于市场观察与研究。公开行情页接口没有稳定 SLA；页面始终展示数据时间、抓取时间、历史回放和延迟状态，不生成自动交易指令。</p>
+    </section>
+  </main>
+
+  <dialog id="settingsDialog" class="dashboard-dialog settings-dialog" aria-labelledby="settingsDialogTitle">
+    <div class="dialog-shell">
+      <div class="dialog-head">
+        <div><span>SETTINGS</span><h2 id="settingsDialogTitle">设置与数据口径</h2></div>
+        <button id="settingsClose" class="dialog-close" type="button" aria-label="关闭设置">×</button>
+      </div>
+      <section class="source-ledger" aria-label="数据源与时间口径">
+        <div class="panel-title">
+          <div><span>DATA</span><h2>数据源与时间口径（每个图都从这里追溯）</h2></div>
+          <small id="collectorState">后台连续采集器：读取中</small>
+        </div>
+        <div class="source-summary">
+          <span><b>本地连续库</b><em id="historyPath">--</em></span>
+          <span><b>板块轨迹</b><em id="sectorHistoryStats">--</em></span>
+          <span><b>个股轨迹</b><em id="stockHistoryStats">--</em></span>
+          <span><b>保留周期</b><em id="historyRetention">--</em></span>
+        </div>
+        <div class="source-table-wrap">
+          <table class="source-table">
+            <thead><tr><th>页面功能</th><th>真实来源 / 接口</th><th>查询和字段</th><th>刷新与边界</th></tr></thead>
+            <tbody id="sourceRows"><tr><td colspan="4">正在读取数据源台账…</td></tr></tbody>
+          </table>
+        </div>
+        <div class="source-warning" id="sourceWarning">东方财富资金流是供应商估算口径；同花顺目前只做抽样核验，不进入3秒自动主链。</div>
+      </section>
+    </div>
+  </dialog>
+
+  <dialog id="stockTerminalDialog" class="dashboard-dialog terminal-dialog" aria-labelledby="stockTerminalDialogTitle">
+    <div class="dialog-shell">
+      <div class="dialog-head">
+        <div><span>TERMINAL</span><h2 id="stockTerminalDialogTitle">个股成交与盘口终端</h2></div>
+        <button id="stockTerminalClose" class="dialog-close" type="button" aria-label="关闭成交终端">×</button>
+      </div>
+      <div id="stockTerminalModalMount" class="stock-terminal-modal-mount">
+        <div class="modal-mount-hint">打开弹窗后，当前个股成交终端将在这里展开显示。</div>
+      </div>
+    </div>
+  </dialog>
+  <script src="/static/market_heatmap.js?v=20260713.11"></script>
+</body>
+</html>

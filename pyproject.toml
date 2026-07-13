@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "market-liquidity-radar"
+version = "1.0.0"
+description = "Local-first A-share market liquidity visualization dashboard"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Market Liquidity Radar contributors" }]
+dependencies = [
+  "requests>=2.31,<3",
+  "urllib3<2; python_version<'3.10'",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Office/Business :: Financial",
+]
+
+[project.scripts]
+market-liquidity-radar = "market_liquidity_radar.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+market_liquidity_radar = ["web/*.html", "web/static/*.css", "web/static/*.js"]
+
+[project.optional-dependencies]
+tdx = ["pytdx>=1.72"]
