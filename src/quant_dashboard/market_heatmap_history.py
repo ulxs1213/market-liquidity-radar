@@ -54,6 +54,8 @@ class MarketHeatmapHistoryStore:
                     delta_flow REAL NOT NULL,
                     breadth REAL NOT NULL,
                     strength_score REAL NOT NULL,
+                    rise_count INTEGER NOT NULL DEFAULT 0,
+                    fall_count INTEGER NOT NULL DEFAULT 0,
                     source_host TEXT NOT NULL,
                     possibly_delayed INTEGER NOT NULL,
                     PRIMARY KEY (board_type, code, data_time)
@@ -77,6 +79,11 @@ class MarketHeatmapHistoryStore:
                     turnover_pct REAL NOT NULL,
                     activity_score REAL NOT NULL,
                     rank_no INTEGER NOT NULL,
+                    volume REAL NOT NULL DEFAULT 0,
+                    industry TEXT NOT NULL DEFAULT '',
+                    industry_code TEXT NOT NULL DEFAULT '',
+                    concepts TEXT NOT NULL DEFAULT '',
+                    primary_concept TEXT NOT NULL DEFAULT '',
                     source_host TEXT NOT NULL,
                     possibly_delayed INTEGER NOT NULL,
                     PRIMARY KEY (code, data_time)
@@ -85,6 +92,26 @@ class MarketHeatmapHistoryStore:
                     ON stock_intraday(code, trade_date, data_time);
                 """
             )
+            # Older 8772 files did not retain replay classification fields.
+            # Migrate in place; old rows remain blank/zero and the replay
+            # coverage contract reports that limitation instead of guessing.
+            sector_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(sector_intraday)")}
+            stock_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(stock_intraday)")}
+            for name, definition in (
+                ("rise_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("fall_count", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in sector_columns:
+                    connection.execute(f"ALTER TABLE sector_intraday ADD COLUMN {name} {definition}")
+            for name, definition in (
+                ("volume", "REAL NOT NULL DEFAULT 0"),
+                ("industry", "TEXT NOT NULL DEFAULT ''"),
+                ("industry_code", "TEXT NOT NULL DEFAULT ''"),
+                ("concepts", "TEXT NOT NULL DEFAULT ''"),
+                ("primary_concept", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in stock_columns:
+                    connection.execute(f"ALTER TABLE stock_intraday ADD COLUMN {name} {definition}")
 
     def _load_last_buckets(self) -> None:
         with self._lock, self._connect() as connection:
@@ -138,7 +165,8 @@ class MarketHeatmapHistoryStore:
                     data_time, fetched_at, float(row.get("price") or 0), float(row.get("change_pct") or 0),
                     float(row.get("amount") or 0), float(row.get("main_net_inflow") or 0),
                     float(row.get("main_net_ratio") or 0), float(row.get("delta_flow") or 0),
-                    float(row.get("breadth") or 0), float(row.get("strength_score") or 0), source_host, delayed,
+                    float(row.get("breadth") or 0), float(row.get("strength_score") or 0),
+                    int(row.get("rise_count") or 0), int(row.get("fall_count") or 0), source_host, delayed,
                 )
             )
         if not values:
@@ -153,8 +181,8 @@ class MarketHeatmapHistoryStore:
                 INSERT OR IGNORE INTO sector_intraday (
                     trade_date, board_type, code, name, data_time, fetched_at, price, change_pct,
                     amount, main_net_inflow, main_net_ratio, delta_flow, breadth, strength_score,
-                    source_host, possibly_delayed
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    rise_count, fall_count, source_host, possibly_delayed
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 values,
             )
@@ -180,7 +208,10 @@ class MarketHeatmapHistoryStore:
                     float(row.get("change_pct") or 0), float(row.get("amount") or 0),
                     float(row.get("main_net_inflow") or 0), float(row.get("main_net_ratio") or 0),
                     float(row.get("volume_ratio") or 0), float(row.get("turnover_pct") or 0),
-                    float(row.get("activity_score") or 0), int(row.get("rank") or 0), source_host, delayed,
+                    float(row.get("activity_score") or 0), int(row.get("rank") or 0),
+                    float(row.get("volume") or 0), str(row.get("industry") or ""),
+                    str(row.get("industry_code") or ""), str(row.get("concepts") or ""),
+                    str(row.get("primary_concept") or ""), source_host, delayed,
                 )
             )
         if not values:
@@ -195,8 +226,9 @@ class MarketHeatmapHistoryStore:
                 INSERT OR IGNORE INTO stock_intraday (
                     trade_date, code, market, name, data_time, fetched_at, price, change_pct, amount,
                     main_net_inflow, main_net_ratio, volume_ratio, turnover_pct, activity_score,
-                    rank_no, source_host, possibly_delayed
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    rank_no, volume, industry, industry_code, concepts, primary_concept,
+                    source_host, possibly_delayed
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 values,
             )
@@ -370,6 +402,166 @@ class MarketHeatmapHistoryStore:
                 (code, selected, max(1, min(20000, int(limit)))),
             ).fetchall()
         return selected, [dict(row) for row in rows]
+
+    @staticmethod
+    def _regular_session_labels() -> list[str]:
+        labels: list[str] = []
+        for start, end in ((9 * 60 + 30, 11 * 60 + 30), (13 * 60, 15 * 60)):
+            labels.extend(f"{minute // 60:02d}:{minute % 60:02d}" for minute in range(start, end + 1))
+        return labels
+
+    def replay_manifest(self, board_type: str, trade_date: str = "", date_limit: int = 30) -> dict[str, Any]:
+        """Describe only replay frames that were actually archived locally.
+
+        A frame is an observed minute bucket.  Missing buckets are explicit;
+        this method never creates a synthetic 242-minute day or forward-fills
+        a stock/sector cross-section.
+        """
+        board_type = str(board_type or "industry").lower()
+        if board_type not in {"industry", "concept"}:
+            return {"ok": False, "error": "board_type 仅支持 industry 或 concept", "frames": []}
+        requested = str(trade_date or "")[:10]
+        with self._lock, self._connect() as connection:
+            date_rows = connection.execute(
+                """
+                SELECT trade_date, COUNT(*) AS rows, COUNT(DISTINCT code) AS codes,
+                       COUNT(DISTINCT substr(data_time,1,16)) AS frame_count,
+                       MIN(data_time) AS first_time, MAX(data_time) AS last_time
+                FROM sector_intraday
+                WHERE board_type = ?
+                GROUP BY trade_date
+                ORDER BY trade_date DESC
+                LIMIT ?
+                """,
+                (board_type, max(1, min(120, int(date_limit)))),
+            ).fetchall()
+            selected = requested or (str(date_rows[0]["trade_date"]) if date_rows else "")
+            sector_rows = connection.execute(
+                """
+                SELECT substr(data_time,1,16) AS frame_time, COUNT(*) AS row_count,
+                       COUNT(DISTINCT code) AS code_count
+                FROM sector_intraday
+                WHERE board_type = ? AND trade_date = ?
+                GROUP BY substr(data_time,1,16)
+                ORDER BY frame_time ASC
+                """,
+                (board_type, selected),
+            ).fetchall() if selected else []
+            stock_rows = connection.execute(
+                """
+                SELECT substr(data_time,1,16) AS frame_time, COUNT(*) AS row_count,
+                       COUNT(DISTINCT code) AS code_count,
+                       SUM(CASE WHEN industry <> '' OR concepts <> '' THEN 1 ELSE 0 END) AS classified_count
+                FROM stock_intraday
+                WHERE trade_date = ?
+                GROUP BY substr(data_time,1,16)
+                ORDER BY frame_time ASC
+                """,
+                (selected,),
+            ).fetchall() if selected else []
+
+        sector_by_time = {str(row["frame_time"]): dict(row) for row in sector_rows}
+        stock_by_time = {str(row["frame_time"]): dict(row) for row in stock_rows}
+        # A replay frame must be able to drive 01/02/03 at minimum.  Stock-only
+        # buckets are still disclosed below, but are not offered as playable
+        # frames because replay_frame() correctly refuses to carry a sector
+        # cross-section forward into that minute.
+        observed_times = sorted(sector_by_time)
+        stock_only_times = sorted(set(stock_by_time) - set(sector_by_time))
+        expected_sector_codes = max((int(row["code_count"] or 0) for row in sector_rows), default=0)
+        expected_stock_codes = max((int(row["code_count"] or 0) for row in stock_rows), default=0)
+        frames = []
+        for frame_time in observed_times:
+            sector = sector_by_time.get(frame_time) or {}
+            stock = stock_by_time.get(frame_time) or {}
+            sector_count = int(sector.get("code_count") or 0)
+            stock_count = int(stock.get("code_count") or 0)
+            frames.append(
+                {
+                    "time": frame_time,
+                    "label": frame_time[11:16],
+                    "sector_count": sector_count,
+                    "stock_count": stock_count,
+                    "classified_stock_count": int(stock.get("classified_count") or 0),
+                    "sector_complete": bool(expected_sector_codes and sector_count >= expected_sector_codes),
+                    "stock_complete": bool(expected_stock_codes and stock_count >= expected_stock_codes),
+                }
+            )
+
+        labels = self._regular_session_labels()
+        label_index = {label: index for index, label in enumerate(labels)}
+        observed_sector_labels = {time[11:16] for time in sector_by_time}
+        observed_stock_labels = {time[11:16] for time in stock_by_time}
+        first_index = min((label_index[label] for label in observed_sector_labels if label in label_index), default=-1)
+        last_index = max((label_index[label] for label in observed_sector_labels if label in label_index), default=-1)
+        covered_labels = labels[first_index:last_index + 1] if first_index >= 0 and last_index >= first_index else []
+        sector_missing = [label for label in covered_labels if label not in observed_sector_labels]
+        stock_missing = [label for label in covered_labels if label not in observed_stock_labels]
+        available_dates = [dict(row) for row in date_rows]
+        requested_missing = bool(requested and not sector_rows)
+        return {
+            "ok": bool(frames) and not requested_missing,
+            "board_type": board_type,
+            "trade_date": selected,
+            "available_dates": available_dates,
+            "frames": frames,
+            "coverage": {
+                "first_observed": observed_times[0] if observed_times else "",
+                "last_observed": observed_times[-1] if observed_times else "",
+                "observed_frame_count": len(observed_times),
+                "stock_only_frame_count": len(stock_only_times),
+                "stock_only_frame_labels": [time[11:16] for time in stock_only_times],
+                "sector_frame_count": len(sector_rows),
+                "stock_frame_count": len(stock_rows),
+                "expected_session_slots": len(labels),
+                "expected_sector_codes_per_frame": expected_sector_codes,
+                "expected_stock_codes_per_frame": expected_stock_codes,
+                "sector_missing_minutes_within_coverage": sector_missing,
+                "stock_missing_minutes_within_coverage": stock_missing,
+                "classified_stock_rows_available": any(int(row["classified_count"] or 0) > 0 for row in stock_rows),
+                "complete_day": len(sector_rows) == len(labels) and not sector_missing,
+                "contract": "仅播放8772本地SQLite真实留档分钟；服务未运行、源失败和旧库未保存分类字段的时段保持缺口，不插值、不前向填充。",
+            },
+            "error": "所选日期没有本地板块分钟留档" if requested_missing or not frames else "",
+        }
+
+    def replay_frame_rows(
+        self,
+        board_type: str,
+        trade_date: str,
+        frame_time: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Return exact cross-sections for one archived minute bucket."""
+        selected = str(trade_date or "")[:10]
+        minute = str(frame_time or "")[-5:]
+        if not selected or not self._in_trading_session(f"{selected}T{minute}:00"):
+            return [], []
+        bucket = f"{selected}T{minute}"
+        with self._lock, self._connect() as connection:
+            sectors = connection.execute(
+                """
+                SELECT code, name, data_time, price, change_pct, amount, main_net_inflow,
+                       main_net_ratio, delta_flow, breadth, strength_score, rise_count,
+                       fall_count, source_host, possibly_delayed
+                FROM sector_intraday
+                WHERE board_type = ? AND trade_date = ? AND replace(substr(data_time,1,16),' ','T') = ?
+                ORDER BY main_net_inflow DESC
+                """,
+                (board_type, selected, bucket),
+            ).fetchall()
+            stocks = connection.execute(
+                """
+                SELECT code, market, name, data_time, price, change_pct, amount,
+                       main_net_inflow, main_net_ratio, volume_ratio, turnover_pct,
+                       activity_score, rank_no AS rank, volume, industry, industry_code,
+                       concepts, primary_concept, source_host, possibly_delayed
+                FROM stock_intraday
+                WHERE trade_date = ? AND replace(substr(data_time,1,16),' ','T') = ?
+                ORDER BY rank_no ASC, activity_score DESC
+                """,
+                (selected, bucket),
+            ).fetchall()
+        return [dict(row) for row in sectors], [dict(row) for row in stocks]
 
     def purge(self) -> dict[str, int]:
         cutoff = (date.today() - timedelta(days=self.retention_days)).isoformat()

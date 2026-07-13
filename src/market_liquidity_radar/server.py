@@ -128,6 +128,25 @@ def _handler(service: Any, data_dir: Path) -> type[BaseHTTPRequestHandler]:
                     include_auction = (query.get("include_auction") or ["0"])[0].lower() in {"1", "true", "yes", "on"}
                     payload = service.session_axis(trade_date=trade_date, include_auction=include_auction)
                     self._json(payload, 200 if payload.get("ok") else 400)
+                elif path == "/api/market_heatmap/replay_manifest":
+                    board_type = (query.get("board_type") or ["industry"])[0]
+                    trade_date = (query.get("trade_date") or [""])[0]
+                    payload = service.replay_manifest(board_type=board_type, trade_date=trade_date)
+                    self._json(payload, 200 if payload.get("ok") else 404)
+                elif path == "/api/market_heatmap/replay_frame":
+                    board_type = (query.get("board_type") or ["industry"])[0]
+                    trade_date = (query.get("trade_date") or [""])[0]
+                    frame_time = (query.get("frame_time") or [""])[0]
+                    selected_code = (query.get("selected_code") or [""])[0]
+                    top_each = _int((query.get("top_each") or ["5"])[0], 5, 1, 500)
+                    payload = service.replay_frame(
+                        board_type=board_type,
+                        trade_date=trade_date,
+                        frame_time=frame_time,
+                        selected_code=selected_code,
+                        top_each=top_each,
+                    )
+                    self._json(payload, 200 if payload.get("ok") else 404)
                 elif path == "/api/market_heatmap/timeline":
                     code = (query.get("code") or [""])[0]
                     limit = _int((query.get("limit") or ["10000"])[0], 10000, 1, 20000)
